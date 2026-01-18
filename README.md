@@ -38,17 +38,17 @@
 
 ```mermaid
 graph TD
-    User[使用者 (ESP32/Voice)] -->|語音指令| LLM[LLM (小智 AI)]
-    LLM -->|MCP Protocol| MCPServer[Taipei Bus MCP Server]
+    User["使用者 (ESP32/Voice)"] -->|語音指令| LLM["LLM (小智 AI)"]
+    LLM -->|MCP Protocol| MCPServer["Taipei Bus MCP Server"]
     
     subgraph "Backend System"
-        MCPServer -->|Query Status| Cache[Cache Manager]
-        MCPServer -->|Plan Trip| GraphEngine[Graph Engine]
+        MCPServer -->|Query Status| Cache["Cache Manager"]
+        MCPServer -->|Plan Trip| GraphEngine["Graph Engine"]
         
-        Cache -->|Miss| Crawler[Crawler Core]
-        Crawler <-->|HTTP/JSON| ExternalAPI[大台北公車 API]
+        Cache -->|Miss| Crawler["Crawler Core"]
+        Crawler <-->|HTTP/JSON| ExternalAPI["大台北公車 API"]
         
-        GraphEngine -->|Read| StaticData[Static Graph JSON]
+        GraphEngine -->|Read| StaticData["Static Graph JSON"]
     end
     
     MCPServer -->|Response| LLM
