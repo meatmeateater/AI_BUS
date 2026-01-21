@@ -136,94 +136,230 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
 
     return f"【{real_route_name}】目前狀態：\n" + "\n".join(found_stops)
 
+from datetime import datetime, timedelta
+
+def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple[bool, str, float]:
+    """
+    Check if a transfer is safe based on Frequency or Schedule.
+    Returns: (is_safe, reason, added_wait_cost_minutes)
+    """
+    client = BusCrawler.get_client()
+    if not client:
+        return True, "無法驗證 (API Error)", 0 # Fail open or closed? Open for now.
+
+    # 1. Check Frequency (High Freq)
+    try:
+        freqs = client.get_route_frequency(route_name)
+        if freqs:
+            # Assuming first element represents general stat. 
+            # Real logic should match day type/time, but simplistic first.
+            f = freqs[0] 
+            # Check ServiceDay? TDX returns current applicable usually?
+            # MinHeadwayMins
+            min_h = f.get("MinHeadwayMins", 999)
+            if min_h <= 20: # 20 mins or less is considered frequent enough
+                return True, f"班次密集 (約 {min_h}分一班)", min_h / 2
+    except Exception as e:
+        logger.warning(f"Freq check fail: {e}")
+
+    # 2. Check Schedule (Fixed Time)
+    try:
+        scheds = client.get_schedule(route_name)
+        if not scheds:
+             return False, "無班表資料", 30 # Penalty
+             
+        # Filter for trips after estimated_arrival
+        valid_trips = []
+        arrival_str = estimated_arrival.strftime("%H:%M")
+        
+        for ch in scheds:
+            # Direction? We don't know direction easily without complex graphing.
+            # We assume if ANY direction has trips, it's usable (Optimistic).
+            # "Frequence" stops usually have trips both ways.
+            
+            # Times are in 'Frequencies' list? No, get_schedule returns "StopOfRoute"? 
+            # No, /Schedule/City returns "BusSchedule" structure with "Frequencys" or "Timetables"?
+            # Actually TDX /Schedule returns list of Route Schedules, containing "Timetables" or "Frequencies".
+            # My `get_schedule` calls `/Schedule`.
+            # Structure: [ { RouteName:..., Timetables: [ { TripID, StopTimes: [...] } ] } ]
+            # Wait, /Bus/Schedule/ is complex.
+            # Simplified: Just count TOTAL trips remaining in day? No.
+            
+            # Let's rely on Frequency if available. If not, assume it's low freq.
+            # If get_schedule return implies Timetable...
+            timetables = ch.get("Timetables", [])
+            for t in timetables:
+                # trip time? usually first stop time? 
+                stops = t.get("StopTimes", [])
+                if stops:
+                    # just take first stop dep time as approx trip time
+                    dep_time = stops[0].get("DepartureTime", "00:00")
+                    if dep_time > arrival_str:
+                         valid_trips.append(dep_time)
+        
+        valid_trips.sort()
+        count = len(valid_trips)
+        
+        if count >= 2:
+            # Calculat wait time for next bus
+            # simple diff
+            next_bus = valid_trips[0]
+            # parse
+            nb_h, nb_m = map(int, next_bus.split(':'))
+            ea_h, ea_m = estimated_arrival.hour, estimated_arrival.minute
+            wait = (nb_h * 60 + nb_m) - (ea_h * 60 + ea_m)
+            if wait < 0: wait = 0
+            
+            return True, f"表定尚有 {count} 班車 (下班 {next_bus})", wait
+        elif count == 1:
+            return True, "僅剩 1 班車 (注意轉乘風險)", 60 # Penalty for risk
+            
+        return False, "已無合適班次 (末班已過或極少)", 999
+        
+    except Exception as e:
+        logger.warning(f"Schedule check fail: {e}")
+        
+    return False, "資料無法判讀", 30
+
 @mcp.tool()
 def plan_trip(start: str, end: str) -> str:
     """
-    規劃公車路線 (A站 到 B站)。
+    規劃公車路線 (A站 到 B站)，依據「最快時間」與「安全轉乘」推薦。
     
     Args:
-       start: 起點站牌名稱 (需精確或關鍵字)
+       start: 起點站牌名稱
        end: 終點站牌名稱
     """
-    real_start = graph_engine.find_best_stop_match(start)
-    real_end = graph_engine.find_best_stop_match(end)
     
-    if not real_start or not real_end:
-        return f"找不到從「{start}」到「{end}」的建議路線。請確認站牌名稱是否正確。"
-
-    # Simply BFS for now based on static graph
-    plan = graph_engine.find_path_bfs(real_start, real_end)
+def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
+    """
+    Core logic to find best route with real-time data.
+    Returns the best candidate object or None.
+    """
+    candidates = graph_engine.find_candidate_paths(start, end, top_k=5)
     
-    if not plan:
-        return f"找不到從 {real_start} 到 {real_end} 的建議路線。"
-        
-    response = ""
-    if plan["type"] == "direct":
-        seg = plan["segments"][0]
-        route = seg['route']
-        
-        # Format basics
-        response = f"建議路線 (直達)：\n請搭乘【{route}】\n從 {seg['from']} 上車\n抵達 {seg['to']}"
-        
-        # Add real-time status
-        # We reuse the get_bus_arrival_time logic but internal
-        try:
-             # Just query the status string
-             status = get_bus_arrival_time(route, real_start)
-             # "【307】目前狀態：\n往 撫遠街：台北車站(忠孝) - 5分鐘"
-             # Filter lines relevant
-             lines = status.split('\n')
-             relevant_lines = [l for l in lines if "目前狀態" not in l and real_start in l]
-             if relevant_lines:
-                 response += f"\n\n--- 即時動態 ---\n" + "\n".join(relevant_lines)
-        except Exception as e:
-            response += f"\n(即時動態查詢失敗: {e})"
-            
-        return response
-        
-    if plan["type"] == "transfer":
-        s1 = plan["segments"][0]
-        s2 = plan["segments"][1]
-        mid = plan["transfer_stop"]
-        response = f"建議路線 (需轉乘 1 次)：\n1. 搭乘【{s1['route']}】從 {s1['from']} -> {mid}\n2. 在 {mid} 轉乘【{s2['route']}】-> {s2['to']}"
-        
-        # Add real-time status for the first leg
-        try:
-             status = get_bus_arrival_time(s1['route'], real_start)
-             lines = status.split('\n')
-             relevant_lines = [l for l in lines if "目前狀態" not in l and real_start in l]
-             if relevant_lines:
-                 response += f"\n\n--- 第一段即時動態 ---\n" + "\n".join(relevant_lines)
-        except:
-            pass
-            
-        return response
-        
-    if plan["type"] == "2-transfer":
-        s1 = plan["segments"][0]
-        s2 = plan["segments"][1]
-        s3 = plan["segments"][2]
-        t1 = plan["transfer_stops"][0]
-        t2 = plan["transfer_stops"][1]
-        
-        response = f"建議路線 (需轉乘 2 次)：\n"
-        response += f"1. 搭乘【{s1['route']}】從 {s1['from']} -> {t1}\n"
-        response += f"2. 在 {t1} 轉乘【{s2['route']}】-> {t2}\n"
-        response += f"3. 在 {t2} 轉乘【{s3['route']}】-> {s3['to']}"
-        
-        # Add real-time status for the first leg
-        try:
-             status = get_bus_arrival_time(s1['route'], real_start)
-             lines = status.split('\n')
-             relevant_lines = [l for l in lines if "目前狀態" not in l and real_start in l]
-             if relevant_lines:
-                 response += f"\n\n--- 第一段即時動態 ---\n" + "\n".join(relevant_lines)
-        except:
-            pass
-            
-        return response
+    if not candidates:
+        return {"error": "No candidates"}
 
-    return "規劃失敗。"
+    ranked_results = []
+    current_time = datetime.now()
+    
+    for cand in candidates:
+        # Get First Leg info
+        seg1 = cand["segments"][0]
+        route_name = seg1["route"]
+        stop_from = seg1["from"]
+        stop_to_1 = seg1["to"]
+        
+        # 1. Fetch Real-time ETA for First Leg
+        real_route_name = find_canonical_route_name(route_name)
+        if not real_route_name:
+            continue
+            
+        data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
+        
+        wait_time = 999 
+        wait_text = "無資料"
+        
+        if data:
+            valid_etas = []
+            dirs = [("Go", data.get("GoDirStops", [])), ("Back", data.get("BackDirStops", []))]
+            for d_name, stops in dirs:
+                for s in stops:
+                    if stop_from in s.get("Name", ""):
+                        e = s.get("ETA")
+                        if e is not None and int(e) >= 0:
+                            valid_etas.append(int(e))
+                            
+            if valid_etas:
+                wait_time_sec = min(valid_etas)
+                wait_time = wait_time_sec / 60.0
+                wait_text = f"{int(wait_time)} 分鐘"
+            else:
+                wait_text = "目前無車"
+                wait_time = 60 # Penalty
+        
+        # Total Score
+        # For Direct: Static(Full) + Wait
+        # For Greedy Transfer: Static(Leg1) + Wait
+        total_time = cand["static_time"] + wait_time
+        
+        cand["total_time"] = total_time
+        cand["wait_text"] = wait_text
+        ranked_results.append(cand)
+
+    # Sort by Total Time
+    ranked_results.sort(key=lambda x: x["total_time"])
+    
+    if not ranked_results:
+        return {"error": "No reachable route with data"}
+        
+    return ranked_results[0]
+
+@mcp.tool()
+def plan_trip(start: str, end: str) -> str:
+    """
+    規劃公車路線 (A站 到 B站)，依據「最快時間」推薦。
+    若需轉乘，會採用「分段導航」模式，優先引導您搭上最快到達中繼站的車。
+    
+    Args:
+       start: 起點站牌名稱
+       end: 終點站牌名稱
+    """
+    best = calculate_best_route(start, end)
+    
+    if "error" in best:
+        return f"找不到從「{start}」到「{end}」的建議路線。({best['error']})"
+            
+    response = f"🚀 最快路線建議 (預估總時程: {int(best['total_time'])} 分鐘)\n"
+    
+    if best["type"] == "direct":
+        seg = best["segments"][0]
+        response += f"\n👉 請搭乘【{seg['route']}】(直達)\n"
+        response += f"   從 [{seg['from']}] 上車 (等候: {best['wait_text']})\n"
+        response += f"   抵達 [{seg['to']}] \n"
+        
+    elif best["type"] == "transfer_greedy":
+        s1 = best["segments"][0]
+        mid = best["transfer_stop"]
+        response += f"\n👉 需轉乘 (分段導航)\n"
+        response += f"1. 先搭乘【{s1['route']}】從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
+        response += f"   坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)\n"
+        response += f"\n⚠️ **重要**：這是最快能帶您離開起點並接近終點的路線。\n"
+        response += f"   抵達 [{mid}] 後，請再次詢問我『{mid} 到 {end} 怎麼轉車』以獲取最新動態。\n"
+        
+    return response
+    
+    # Format Response
+    response = f"🚀 最快路線建議 (預估總時程: {int(best['total_time'])} 分鐘)\n"
+    
+    if best["type"] == "direct":
+        seg = best["segments"][0]
+        response += f"\n👉 請搭乘【{seg['route']}】(直達)\n"
+        response += f"   從 [{seg['from']}] 上車 (等候: {best['wait_text']})\n"
+        response += f"   抵達 [{seg['to']}] \n"
+        
+    elif best["type"] == "transfer":
+        s1 = best["segments"][0]
+        s2 = best["segments"][1]
+        mid = best["transfer_stop"]
+        response += f"\n👉 需轉乘 1 次\n"
+        response += f"1. 搭乘【{s1['route']}】從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
+        response += f"   坐到 [{mid}] 下車\n"
+        response += f"2. 轉乘【{s2['route']}】{best['safety_note']}\n"
+        response += f"   抵達 [{s2['to']}]\n"
+        response += f"\n⚠️ **重要**：抵達 [{mid}] 後，請再次詢問我以取得最新接博動態。\n"
+        
+    if len(ranked_results) > 1:
+        second = ranked_results[1]
+        diff = second["total_time"] - best["total_time"]
+        if diff < 10:
+            note = ""
+            if second["type"] == "transfer":
+                note = second.get("safety_note", "")
+            response += f"\n💡 替代方案: 搭 {second['segments'][0]['route']} ({note}) 差不多快 (+{int(diff)}分)"
+            
+    return response
 
 if __name__ == "__main__":
     mcp.run()

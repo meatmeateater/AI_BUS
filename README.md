@@ -1,147 +1,66 @@
-# Taipei Bus AI (台北公車智慧助理)
+# Taipei Bus AI Route Planner (v3)
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![MCP](https://img.shields.io/badge/MCP-Protocol-green.svg)](https://modelcontextprotocol.io/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+A Python-based AI agent that helps navigate the complex Taipei Bus network. It uses the **TDX Transport API** for real-time data and employs a custom **Greedy Hop & Recursive Bridging** algorithm to find efficient routes, even for difficult, multi-transfer destinations.
 
-> **Taipei Bus AI** 是一個基於 Model Context Protocol (MCP) 建構的智慧交通中介系統。
-> 專為 ESP32 等語音邊緣裝置設計，整合「大台北公車」即時動態 API 與靜態路網資料，提供低延遲、高準確度的語音公車查詢與導航服務。
+## 🚀 Key Features
 
----
+- **Real-time & Static Data Hybrid**: Combines a static route graph (for connectivity) with real-time ETA data (for accurate decision making).
+- **Greedy Hop Algorithm (v3)**:
+    - **Priority 1: Direct Routes**. Always prefers a direct bus if available.
+    - **Priority 2: Greedy Hop (1-Transfer)**. Finds the fastest bus to a major transfer hub, then instructs the user to "Ask Again" at the hub. This mimics human intuition ("Get on the bus first!").
+    - **Priority 3: Recursive Bridging (>1 Transfer)**. Solves deep connectivity issues by finding a "Bridge Route" to connect distant zones, guiding the user to the first transfer point.
+- **MCP Server Integration**: Designed to work as a tool for AI assistants (Claude, Cursor, etc.).
+- **Benchmark Suite**: Includes scripts to verify route quality against random or specific destinations.
 
-## 📖 專案簡介 (Introduction)
+## 🛠️ Installation
 
-本專案旨在解決傳統公車查詢 App 操作繁瑣的問題。透過 MCP 協定，將「公車動態爬蟲」與「路網導航引擎」封裝為 AI 可呼叫的工具 (Tools)。
+1. Clone the repository.
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set up environment variables in `.env` (copy from `.env.example`):
+   ```
+   TDX_CLIENT_ID=your_client_id
+   TDX_CLIENT_SECRET=your_client_secret
+   ```
 
-這讓 LLM (如小智 AI、Claude、ChatGPT) 能直接理解複雜的自然語言需求，並回傳精確的答案：
-*   ❌ "307號公車在哪？"
-*   ✅ **"307號公車還有 5 分鐘到台北車站，目前在板橋公車站發車。"**
-*   ✅ **"我要從大安森林公園去深坑，請幫我規劃路線。"**
+## 🏗️ Project Structure
 
-### 核心模組
-1.  **韌性爬蟲 (Resilient Crawler)**: 處理動態 CSRF Token、雙層 JSON 解析與錯誤重試。
-2.  **導航引擎 (Navigation Engine)**: 基於 BFS 演算法，支援 **2次轉乘** (2-Transfer) 的路徑規劃。
-3.  **快取層 (Cache Layer)**: 實作 TTL 180秒快取，防止 API 過載並提升回應速度。
+- `src/`
+    - `mcp_server.py`: Main entry point. Defines tools `plan_trip` and `get_bus_arrival_time`.
+    - `graph_engine.py`: Core pathfinding logic (Greedy Hop implementation).
+    - `tdx_client.py`: Handles TDX API authentication and data fetching.
+    - `crawler_core.py`: Legacy crawler adapter.
+- `data/static/bus_graph.json`: Pre-built graph of Taipei/New Taipei bus network.
+- `scripts/`
+    - `benchmark_random.py`: Test 50 random destinations.
+    - `simulate_full_journey.py`: Simulate the full multi-leg journey (recursive requests).
+    - `build_network_graph.py`: (Optional) Re-build static graph.
 
-## 🚀 核心功能 (Features)
+## 🧪 Running Benchmarks
 
-- **即時到站查詢**: 支援雙北市 1000+ 條路線，自動判別去返程。
-- **智慧導航規劃**: 
-    - 支援「直達」、「轉乘 1 次」與「轉乘 2 次」路徑搜尋。
-    - **模糊搜尋**: 輸入 "北車" 自動對應到 "台北車站(忠孝)"。
-    - **整合動態**: 規劃結果直接附帶建議班次的「預估到站時間」。
-- **高效能架構**: 
-    - **靜態路網圖**: 預先建置 Graph，導航計算 < 0.01 秒。
-    - **記憶體快取**: 降低來源網站 90% 重複請求。
-
-## 🛠️ 系統架構 (Architecture)
-
-```mermaid
-graph TD
-    User["使用者 (ESP32/Voice)"] -->|語音指令| LLM["LLM (小智 AI)"]
-    LLM -->|MCP Protocol| MCPServer["Taipei Bus MCP Server"]
-    
-    subgraph "Backend System"
-        MCPServer -->|Query Status| Cache["Cache Manager"]
-        MCPServer -->|Plan Trip| GraphEngine["Graph Engine"]
-        
-        Cache -->|Miss| Crawler["Crawler Core"]
-        Crawler <-->|HTTP/JSON| ExternalAPI["大台北公車 API"]
-        
-        GraphEngine -->|Read| StaticData["Static Graph JSON"]
-    end
-    
-    MCPServer -->|Response| LLM
-    LLM -->|Natural Language| User
-```
-
-## ⚡ 快速開始 (Quick Start)
-
-### 環境需求
-- Python 3.9+
-- 網路連線 (需存取 `ebus.gov.taipei`)
-
-### 安裝步驟
-
-1.  **複製專案**
-    ```bash
-    git clone https://github.com/your-repo/TaipeiBusAI.git
-    cd TaipeiBusAI
-    ```
-
-2.  **安裝依賴**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3.  **資料初始化 (重要)**
-    本系統需要下載路線資料才能運作：
-    
-    *Step 1: 下載路線列表*
-    ```bash
-    python scripts/init_static_data.py
-    ```
-    
-    *Step 2: 建置路網圖 (導航功能必備)*
-    **注意**: 此步驟會爬取所有路線站點，需時約 10-20 分鐘。
-    ```bash
-    python scripts/build_network_graph.py
-    ```
-    *(若僅需查詢到站時間，可跳過 Step 2，但無法使用 plan_trip)*
-
-### 啟動伺服器
+To verify the algorithm's performance:
 
 ```bash
-# Windows
-scripts\run_server.bat
+# Run random 50-stop test
+python scripts/benchmark_random.py
 
-# Linux / Mac
-python src/mcp_server.py
+# Run full journey simulation (chains multiple requests)
+python scripts/simulate_full_journey.py
 ```
 
-## 🔌 MCP 工具說明
+## 📝 Algorithm Logic
 
-本伺服器提供以下 Tools 供 AI 模型呼叫：
+**Why Greedy Hop?**
+Traditional BFS algorithms fail on large, real-time networks because predicting a second transfer 1 hour in the future is unreliable.
+Our approach:
+1. **Focus on Leg 1**: Find the best bus *right now*.
+2. **Guide to Hub**: If no direct bus, get the user to a transfer hub or bridge route.
+3. **Recursive Inquiry**: Once at the hub, re-evaluate with fresh data.
 
-### `get_bus_arrival_time`
-查詢公車到站資訊。
-- **參數**: `route_name` (e.g. "307"), `stop_name` (e.g. "板橋"), `direction` (optional)
-- **回傳**: 文字描述，包含該站牌所有相符方向的班次狀態。
+This results in higher success rates and more practical advice for commuters.
 
-### `plan_trip`
-規劃最佳公車路線。
-- **參數**: `start` (起點), `end` (終點)
-- **功能**: 
-    - 自動進行站名模糊比對。
-    - 優先尋找直達車，其次轉乘 1 次，最後轉乘 2 次。
-    - 自動查詢建議路線的即時到站時間。
-
-## 📂 專案結構
-
-```plaintext
-TaipeiBusAI/
-├── config/              
-├── data/
-│   ├── static/          # routes_map.json, bus_graph.json (路網圖)
-│   └── logs/            # 運行日誌與 Debug 報表
-├── scripts/             
-│   ├── init_static_data.py    # 抓取路線列表
-│   ├── build_network_graph.py # 建立路網圖 (Graph Builder)
-│   ├── debug_route_to_csv.py  # 匯出特定路線資料
-│   └── run_server.bat         # 啟動腳本
-├── src/                 
-│   ├── crawler_core.py  # 爬蟲引擎
-│   ├── graph_engine.py  # 導航演算法 (BFS/Fuzzy Search)
-│   ├── mcp_server.py    # MCP Server
-│   └── cache_manager.py # 快取層
-└── requirements.txt     
-```
-
-## 🤝 貢獻指南
-
-歡迎提交 PR 改進演算法或支援更多縣市公車。
-特別感謝：大台北公車網站提供公開資料。
-
-## 📄 授權 (License)
-
-MIT License
+## ⚠️ Notes
+- The system caches real-time data for 60 seconds to respect API rate limits.
+- "Safe Transfer" warnings are issued if a connecting bus has low frequency.

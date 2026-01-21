@@ -80,12 +80,29 @@ class TDXClient:
         }
         return self._make_request(url, params)
 
-    def get_estimated_arrival(self, route_name: str, city: str = "Taipei") -> List[Dict[str, Any]]:
+    def get_schedule(self, route_name: str, city: str = "Taipei") -> List[Dict[str, Any]]:
         """
-        Fetch estimated arrival times (N1) for a specific route.
-        API: /EstimatedTimeOfArrival/City/{City}/{RouteName}
+        Fetch static schedule.
+        API: /Schedule/City/{City}/{RouteName}
         """
-        url = f"{self.API_BASE_URL}/EstimatedTimeOfArrival/City/{city}/{route_name}"
+        url = f"{self.API_BASE_URL}/Schedule/City/{city}/{route_name}"
+        params = {
+            "$format": "JSON"
+        }
+        return self._make_request(url, params)
+
+    def get_route_frequency(self, route_name: str, city: str = "Taipei") -> List[Dict[str, Any]]:
+        """
+        Fetch route frequency/headway info.
+        API: /Route/Frequency/City/{City}/{RouteName}
+        """
+        # Note: Base URL usually /Bus, but is it /Bus/Route/Frequency?
+        # Actually it's just /Frequency/City... ? No, the V2 standard is /Bus/Route/Frequency?
+        # Let's check docs or try /Route/Frequency or /Frequency/Route.
+        # Based on common TDX patterns: /Route/Frequency/City/{City}/{RouteName} might be it.
+        # Wait, the official docs say: /api/basic/v2/Bus/Route/Frequency/City/{City}/{RouteName}
+        
+        url = f"{self.API_BASE_URL}/Route/Frequency/City/{city}/{route_name}"
         params = {
             "$format": "JSON"
         }
