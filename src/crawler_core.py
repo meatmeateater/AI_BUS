@@ -1,11 +1,7 @@
-import requests
-from bs4 import BeautifulSoup
-import json
 import logging
 import os
-import re
-import time
 from typing import Optional, Dict, Any, List
+from .tdx_client import TDXClient
 
 # Setup logging
 log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'logs')
@@ -19,202 +15,149 @@ logging.basicConfig(
 )
 
 class BusCrawler:
-    BASE_URL = "https://ebus.gov.taipei/Route/StopsOfRoute"
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    
+    """
+    Adapter class to fetch bus data using TDXClient.
+    Replaces the old HTML scraping logic.
+    """
+    _client = None
+
     @classmethod
-    def get_route_data(cls, route_id: str, only_static: bool = False) -> Optional[Dict[str, Any]]:
-        """
-        Fetch route data from ebus.gov.taipei.
-        If only_static is True, skips the dynamic status update to be faster.
-        """
-        try:
-            response = requests.get(
-                f"{cls.BASE_URL}?routeid={route_id}", 
-                headers={"User-Agent": cls.USER_AGENT},
-                timeout=10
-            )
-            response.raise_for_status()
-        except requests.exceptions.Timeout:
-            logging.warning(f"Timeout fetching route {route_id}, retrying once...")
+    def get_client(cls):
+        if not cls._client:
             try:
-                response = requests.get(
-                    f"{cls.BASE_URL}?routeid={route_id}", 
-                    headers={"User-Agent": cls.USER_AGENT},
-                    timeout=10
-                )
-                response.raise_for_status()
+                cls._client = TDXClient()
             except Exception as e:
-                logging.error(f"Failed to fetch route {route_id} after retry: {e}")
-                return None
-        except Exception as e:
-            logging.error(f"Failed to fetch route {route_id}: {e}")
-            return None
-
-        # Parse logic
-        try:
-            static_data = cls._parse_html(response.text, route_id)
-            
-            if only_static:
-                return static_data
-
-            csrf_token = cls._extract_csrf_token(response.text)
-            
-            if not csrf_token:
-                logging.warning(f"No CSRF token found for route {route_id}, dynamic data might fail.")
-                
-            dynamic_data = cls._fetch_dynamic_status(route_id, csrf_token, response.cookies)
-            
-            return cls._merge_data(static_data, dynamic_data)
-            
-        except Exception as e:
-            # Debug: Dump HTML to file
-            debug_file = os.path.join(log_dir, f"debug_{route_id}.html")
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(response.text)
-            logging.error(f"Error parsing data for route {route_id}: {e}. HTML saved to {debug_file}")
-            return None
-
-    @staticmethod
-    def _extract_csrf_token(html: str) -> Optional[str]:
-        match = re.search(r'name="__RequestVerificationToken" type="hidden" value="(.*?)"', html)
-        if match:
-            return match.group(1)
-        return None
+                logging.error(f"Failed to initialize TDXClient: {e}")
+        return cls._client
 
     @classmethod
-    def _fetch_dynamic_status(cls, route_id: str, token: str, cookies: Any) -> List[Dict[str, Any]]:
-        api_url = "https://ebus.gov.taipei/Route/StopStatusOfRoute"
-        params = {"routeid": route_id}
-        data = {
-            "__RequestVerificationToken": token,
-            "X-Requested-With": "XMLHttpRequest"
-        }
-        headers = {
-            "User-Agent": cls.USER_AGENT,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{cls.BASE_URL}?routeid={route_id}"
-        }
+    def get_route_data(cls, route_name: str, **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        Fetch route data using TDX API.
         
+        Args:
+            route_name: The name of the route (e.g. "307"). 
+                        NOTE: This replaces the old `route_id` usage. 
+                        If a numeric ID is passed, it might fail unless we map it.
+                        The caller should pass the Route Name.
+            **kwargs: Ignored compatibility args.
+        
+        Returns:
+            Dict in the format:
+            {
+                "GoDirStops": [ { "Name": "...", "ETA": int, "NextDepTime": "...", ... }, ... ],
+                "BackDirStops": [ ... ]
+            }
+        """
+        client = cls.get_client()
+        if not client:
+            return None
+
         try:
-            response = requests.post(
-                f"{api_url}?routeid={route_id}", 
-                data=data, 
-                headers=headers, 
-                cookies=cookies,
-                timeout=10
-            )
-            response.raise_for_status()
-            # The API returns a JSON string content, which request.json() returns as a string.
-            # We need to parse that string into a list/object.
-            return json.loads(response.json())
-        except Exception as e:
-            logging.error(f"Failed to fetch dynamic status for {route_id}: {e}")
-            return []
+            # 1. Get Stops (to build the skeleton)
+            # We fetch stops to ensure we have the full list and order.
+            stops_data = client.get_stops(route_name, city="Taipei")
+            if not stops_data:
+                # Try NewTaipei if Taipei fails? 
+                # Many buses are cross-city. TDX usually requires knowing the city.
+                # Let's try NewTaipei if Taipei returns nothing.
+                stops_data = client.get_stops(route_name, city="NewTaipei")
+                if not stops_data:
+                     # One last try: "Taipei" might cover both in some endpoints? No.
+                     logging.warning(f"No stops found for {route_name} in Taipei or NewTaipei")
+                     return None
+                city_found = "NewTaipei"
+            else:
+                city_found = "Taipei"
 
-    @staticmethod
-    def _merge_data(static_data: Dict[str, Any], dynamic_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Merge valid ETA from dynamic_data into static_data.
-        dynamic_data is a flat list of stop statuses.
-        """
-        if not dynamic_data:
-            return static_data
+            # 2. Get Estimates (Real-time data)
+            etas_data = client.get_estimated_arrival(route_name, city=city_found)
             
-        # Create a lookup map for dynamic status: UniStationId -> Status Object
-        status_map = {str(item.get("UniStationId")): item for item in dynamic_data}
-        
-        # Helper to update stop list
-        def update_stops(stops):
-            if not stops:
-                return
-            for stop in stops:
-                uni_id = str(stop.get("UniStopId")) # Note: Static uses UniStopId, Dynamic uses UniStationId usually
-                if uni_id in status_map:
-                    status = status_map[uni_id]
-                    # Update ETA
-                    # ETA in dynamic data: seconds?
-                    # The JS says: if eta < 0 (status code), if eta >= 0 (seconds)
-                    stop["ETA"] = status.get("ETA")
-                    stop["NextDepTime"] = status.get("NextDepTime") # e.g. "12:00"
-                    
-        update_stops(static_data.get("GoDirStops"))
-        update_stops(static_data.get("BackDirStops"))
-        
-        return static_data
+            # Map ETAs for fast lookup: Direction -> StopUID -> ETA Data
+            eta_map = {}
+            for item in etas_data:
+                d = item.get("Direction", 0)
+                uid = item.get("StopUID")
+                if d not in eta_map:
+                    eta_map[d] = {}
+                eta_map[d][uid] = item
 
-    @staticmethod
-    def _parse_html(html_content: str, route_id: str) -> Dict[str, Any]:
-        """
-        Extract routeJsonString from HTML and parse it.
-        """
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # The data is usually embedded in a script tag as 'var routeJsonString = ...'
-        # or inside the html structure depending on the page
-        # Based on user description: "Find routeJsonString, use Regex or string split"
-        
-        scripts = soup.find_all('script')
-        json_str = None
-        
-        for script in scripts:
-            if script.string and 'routeJsonString' in script.string:
-                # Regex to extract the JSON object
-                # Update: The format is var routeJsonString = JSON.stringify({...});
-                match = re.search(r'var\s+routeJsonString\s*=\s*JSON\.stringify\((.*?)\);', script.string, re.DOTALL)
-                if match:
-                    json_str = match.group(1)
-                    break
+            # 3. Assemble Result
+            result = {
+                "GoDirStops": [],
+                "BackDirStops": []
+            }
+
+            for route_dir in stops_data:
+                direction = route_dir.get("Direction", 0) # 0: Go, 1: Back
+                stops = route_dir.get("Stops", [])
                 
-                # Fallback for other potential formats (just in case)
-                match = re.search(r'var\s+routeJsonString\s*=\s*(\[.*?\]);', script.string, re.DOTALL)
-                if match:
-                    json_str = match.group(1)
-                    break
-        
-        if not json_str:
-            raise ValueError("Could not find routeJsonString in HTML")
+                processed_stops = []
+                for stop in stops:
+                    uid = stop.get("StopUID")
+                    name = stop.get("StopName", {}).get("Zh_tw", "Unknown")
+                    
+                    stop_info = {
+                        "Name": name,
+                        "StopUID": uid,
+                        "ETA": None,
+                        "NextDepTime": None
+                    }
+                    
+                    # Merge ETA
+                    if direction in eta_map and uid in eta_map[direction]:
+                        eta_item = eta_map[direction][uid]
+                        # EstimateTime is in seconds.
+                        # TDX: if StopStatus != 0 (Normal), EstimateTime might be null or meaningless?
+                        # StopStatus: 0:Normal, 1:NotStarted, 2:Past, 3:Pit, 4:Operating (but not readable)
+                        status = eta_item.get("StopStatus")
+                        est_time = eta_item.get("EstimateTime")
+                        
+                        if status == 0 and est_time is not None:
+                            stop_info["ETA"] = est_time
+                        elif status == 1:
+                            stop_info["ETA"] = 65535 # Borrowing old crawler code for "Not Started"
+                            # Or check NextBusTime
+                            next_bus = eta_item.get("NextBusTime")
+                            if next_bus:
+                                # Format: 2023-10-27T12:00:00+08:00
+                                # We just want HH:MM
+                                try:
+                                    stop_info["NextDepTime"] = next_bus.split("T")[1][:5]
+                                except:
+                                    pass
+                        elif status == 2: # Past
+                            stop_info["ETA"] = -2 # Arbitrary negative for passed
+                        elif status == 3: # Pit (End of line?)
+                             stop_info["ETA"] = -3
+                        
+                    processed_stops.append(stop_info)
+                
+                if direction == 0:
+                    result["GoDirStops"] = processed_stops
+                elif direction == 1:
+                    result["BackDirStops"] = processed_stops
             
-        data = json.loads(json_str)
-        
-        # The structure is usually a list of directions or an object containing directions
-        # User mentioned "GoDirStops" and "BackDirStops"
-        # Let's inspect the structure conceptually. 
-        # Usually it returns a list of stop objects. We need to group them if they are flat, 
-        # or if the JSON itself has structure. 
-        # Assuming the JSON is the raw list of stops often seen in these ASP.NET pages.
-        # But user mentioned GoDirStops/BackDirStops. Let's return the parsed JSON directly for now
-        # OR format it as requested.
-        
-        # User said: "Extract Name (Stop Name) and Eta (Estimated Time) or BusTimeDesc"
-        # Let's format it for easier consumption.
-        
-        processed_data = {
-            "GoDirStops": [],
-            "BackDirStops": []
-        }
-        
-        # NOTE: Without seeing the actual JSON structure, I am making a best guess based on common patterns
-        # for these systems and the user's prompt. 
-        # Commonly structure: [ { StopName: "...", Eta: "...", GoBack: "0" ... }, ... ]
-        # GoBack: 0 = Go, 1 = Back (Often)
-        # OR: { "Bus" : [ ... ] }
-        # Let's just return the raw data wrapped in a dict if it's a list, or the dict itself.
-        # But the User explicitly asked to "Extract from GoDirStops and BackDirStops". 
-        # This implies the JSON might ALREADY have these keys. 
-        # If the JSON is a list, I might need to look for these keys inside, OR the JSON IS the object with these keys.
-        
-        # I will return the raw data for now to be safe, but I'll add a helper to extract simple info.
-        
-        return data
+            return result
+
+        except Exception as e:
+            logging.error(f"Error fetching TDX data for {route_name}: {e}")
+            return None
 
 if __name__ == "__main__":
-    # Test with a known ID (e.g., 307 which is 0100030700)
-    test_id = "0100030700"
-    data = BusCrawler.get_route_data(test_id)
+    # Test with a known Route Name (e.g., 307)
+    test_route = "307"
+    data = BusCrawler.get_route_data(test_route)
     if data:
         print("Successfully fetched data")
         # Print first few chars to debug structure
-        print(str(data)[:200])
+        print(str(data)[:500])
+        
+        # Check ETA count
+        go_stops = data.get("GoDirStops", [])
+        print(f"Go Stop Count: {len(go_stops)}")
+        if go_stops:
+            print(f"First Stop: {go_stops[0]}")
     else:
         print("Failed to fetch data")
+

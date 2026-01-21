@@ -34,17 +34,18 @@ else:
 # Initialize Graph Engine
 graph_engine = GraphEngine(GRAPH_FILE)
 
-def find_route_id(route_name: str) -> Optional[str]:
+def find_canonical_route_name(route_name: str) -> Optional[str]:
     """
-    Fuzzy search for route ID by name.
+    Fuzzy search for route Name.
+    Returns the canonical route name (e.g. "307" or "復興幹線") key from the map.
     """
     if route_name in routes_map:
-        return routes_map[route_name]
+        return route_name
     
     # Fuzzy match
     matches = difflib.get_close_matches(route_name, routes_map.keys(), n=1, cutoff=0.6)
     if matches:
-        return routes_map[matches[0]]
+        return matches[0]
     
     return None
 
@@ -61,29 +62,23 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
     Returns:
         String describing the arrival time or status.
     """
-    # 1. Find Route ID
-    route_id = find_route_id(route_name)
-    if not route_id:
-        return f"找不到路線：{route_name}"
-    
-    real_route_name = [k for k, v in routes_map.items() if v == route_id][0]
+    # 1. Find Canonical Route Name
+    real_route_name = find_canonical_route_name(route_name)
+    if not real_route_name:
+        # Fallback: if map is empty (might happen if not initialized), try using the input name
+        # TDX usually handles "307" fine. 
+        if not routes_map:
+            real_route_name = route_name
+        else:
+             return f"找不到路線：{route_name}"
 
     # 2. Fetch Data (Cached)
-    data = CacheManager.get_or_fetch(route_id, BusCrawler.get_route_data)
+    # We pass real_route_name to BusCrawler.get_route_data
+    data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
     if not data:
         return f"無法取得 {real_route_name} 的即時資料，請稍後再試。"
 
     # 3. Parse and Find Stop(s)
-    # Data is the raw JSON structure we saw earlier.
-    # It has "GoDirStops" and "BackDirStops" which are Lists of Stops.
-    # Each Stop has "Name" and "BusTimeDesc" (or "BusETA", "ETA"?)
-    # Based on the log, the JSON structure (objArr) has:
-    # "GoDirStops": [ { "Name": "...", "BusETA": 0, "BusTimeDesc": "...", ... }, ... ]
-    # Wait, the log showed `routeJsonString = JSON.stringify({...})`.
-    # And inside `GoDirStops` items have `Name`, `BusETA` etc.
-    
-    # We need to search in both directions if not specified, or specific direction.
-    
     found_stops = []
     
     directions_to_search = []
@@ -114,8 +109,12 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
                      eta_val = int(eta)
                      if eta_val < 0:
                          # Special codes based on observed JS
-                         if eta_val in [65535, 65529]:
+                         if eta_val == 65535 or eta_val == 65529:
                              status_text = "尚未發車"
+                         elif eta_val == -2:
+                             status_text = "已過站"
+                         elif eta_val == -3:
+                             status_text = "末班車已過" # Or Pit
                          else:
                              status_text = "末班車已過"
                      elif eta_val <= 180:
