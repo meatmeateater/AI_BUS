@@ -1,66 +1,52 @@
-# Taipei Bus AI Route Planner (v3)
+# 台北公車 AI 路線規劃助手 (Taipei Bus AI - v3)
 
-A Python-based AI agent that helps navigate the complex Taipei Bus network. It uses the **TDX Transport API** for real-time data and employs a custom **Greedy Hop & Recursive Bridging** algorithm to find efficient routes, even for difficult, multi-transfer destinations.
+這是一個基於 Python 的 AI 代理程式，專為導航台北複雜的公車路網而設計。它結合了 **TDX 交通部運輸資料流通服務** 的即時數據，並採用客製化的 **Greedy Hop (貪婪跳躍) & Recursive Bridging (遞迴橋接)** 演算法，即使是難以到達、需要多次轉乘的目的地，也能找出高效的乘車方案。
 
-## 🚀 Key Features
+## 🚀 核心功能
 
-- **Real-time & Static Data Hybrid**: Combines a static route graph (for connectivity) with real-time ETA data (for accurate decision making).
-- **Greedy Hop Algorithm (v3)**:
-    - **Priority 1: Direct Routes**. Always prefers a direct bus if available.
-    - **Priority 2: Greedy Hop (1-Transfer)**. Finds the fastest bus to a major transfer hub, then instructs the user to "Ask Again" at the hub. This mimics human intuition ("Get on the bus first!").
-    - **Priority 3: Recursive Bridging (>1 Transfer)**. Solves deep connectivity issues by finding a "Bridge Route" to connect distant zones, guiding the user to the first transfer point.
-- **MCP Server Integration**: Designed to work as a tool for AI assistants (Claude, Cursor, etc.).
-- **Benchmark Suite**: Includes scripts to verify route quality against random or specific destinations.
+- **即時與靜態數據混合**：結合靜態路線圖 (用於連通性分析) 與即時預估到站時間 (ETA)，做出最準確的決策。
+- **Greedy Hop 演算法 (v3)**：
+    - **優先級 1：直達路線**。如果有直達車，絕對優先推薦。
+    - **優先級 2：貪婪跳躍 (1次轉乘)**。尋找最快能到達「轉乘樞紐」的公車，並指示使用者在樞紐「抵達後再詢問」。這模擬了在地人的直覺：「先上車，到了再說！」。
+    - **優先級 3：遞迴橋接 (>1次轉乘)**。針對深層路網連通性問題，自動尋找能連接起始區與目的區的「橋接路線」，引導使用者前往這段多程旅途的第一個轉乘點。
+- **MCP Server 整合**：設計為可供 AI 助理 (如 Claude, Cursor 等) 呼叫的工具。
+- **基準測試套件**：內含驗證路線品質的測試腳本 (已在發布版中移除，僅保留核心功能)。
 
-## 🛠️ Installation
+## 🛠️ 安裝教學
 
-1. Clone the repository.
-2. Install dependencies:
+1. 複製 (Clone) 此儲存庫。
+2. 安裝相依套件：
    ```bash
    pip install -r requirements.txt
    ```
-3. Set up environment variables in `.env` (copy from `.env.example`):
+3. 設定環境變數 `.env` (請參考 `.env.example`)：
    ```
-   TDX_CLIENT_ID=your_client_id
-   TDX_CLIENT_SECRET=your_client_secret
+   TDX_CLIENT_ID=你的_client_id
+   TDX_CLIENT_SECRET=你的_client_secret
    ```
 
-## 🏗️ Project Structure
+## 🏗️ 專案結構
 
 - `src/`
-    - `mcp_server.py`: Main entry point. Defines tools `plan_trip` and `get_bus_arrival_time`.
-    - `graph_engine.py`: Core pathfinding logic (Greedy Hop implementation).
-    - `tdx_client.py`: Handles TDX API authentication and data fetching.
-    - `crawler_core.py`: Legacy crawler adapter.
-- `data/static/bus_graph.json`: Pre-built graph of Taipei/New Taipei bus network.
+    - `mcp_server.py`: 主要進入點。定義了 `plan_trip` (規劃路線) 與 `get_bus_arrival_time` (查詢到站) 工具。
+    - `graph_engine.py`: 核心路徑搜尋邏輯 (Greedy Hop 實作)。
+    - `tdx_client.py`: 處理 TDX API 認證與資料抓取。
+    - `crawler_core.py`: 舊版爬蟲轉接器 (Adapter)。
+- `data/static/bus_graph.json`: 預先建立的雙北公車路網圖。
 - `scripts/`
-    - `benchmark_random.py`: Test 50 random destinations.
-    - `simulate_full_journey.py`: Simulate the full multi-leg journey (recursive requests).
-    - `build_network_graph.py`: (Optional) Re-build static graph.
+    - `build_network_graph.py`: (選用) 用於重新建立靜態路網圖。
 
-## 🧪 Running Benchmarks
+## 📝 演算法邏輯
 
-To verify the algorithm's performance:
+**為什麼使用 Greedy Hop (貪婪跳躍)?**
+傳統的 BFS (廣度優先搜尋) 演算法在處理大型即時路網時往往會失敗，因為要準確預測「一小時後」在第二個轉乘點的公車動態是不可靠的。
+我們的策略：
+1. **專注於第一段 (Leg 1)**：找出 *現在* 最好的公車。
+2. **引導至樞紐**：如果沒有直達車，將使用者帶往轉乘樞紐或橋接路線。
+3. **遞迴詢問**：一旦抵達樞紐，再根據最新的即時數據重新評估。
 
-```bash
-# Run random 50-stop test
-python scripts/benchmark_random.py
+這種方法能大幅提高路線的成功率，並為通勤者提供更務實的建議。
 
-# Run full journey simulation (chains multiple requests)
-python scripts/simulate_full_journey.py
-```
-
-## 📝 Algorithm Logic
-
-**Why Greedy Hop?**
-Traditional BFS algorithms fail on large, real-time networks because predicting a second transfer 1 hour in the future is unreliable.
-Our approach:
-1. **Focus on Leg 1**: Find the best bus *right now*.
-2. **Guide to Hub**: If no direct bus, get the user to a transfer hub or bridge route.
-3. **Recursive Inquiry**: Once at the hub, re-evaluate with fresh data.
-
-This results in higher success rates and more practical advice for commuters.
-
-## ⚠️ Notes
-- The system caches real-time data for 60 seconds to respect API rate limits.
-- "Safe Transfer" warnings are issued if a connecting bus has low frequency.
+## ⚠️ 注意事項
+- 系統會快取即時數據 60 秒，以遵守 API 速率限制。
+- 如果轉乘公車的班次頻率較低，系統會發出「安全轉乘」警告。
