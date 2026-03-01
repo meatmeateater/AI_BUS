@@ -1,9 +1,11 @@
 from cachetools import TTLCache
-import time
+import logging
 from typing import Optional, Dict, Any, Callable
 
-# Cache storage: 1000 items, 180 seconds TTL (3 minutes)
-_route_cache = TTLCache(maxsize=1000, ttl=180)
+logger = logging.getLogger(__name__)
+
+# Cache storage: 1000 items, 60 seconds TTL
+_route_cache = TTLCache(maxsize=1000, ttl=60)
 
 class CacheManager:
     @staticmethod
@@ -28,13 +30,13 @@ class CacheManager:
         """
         cached = _route_cache.get(route_id)
         if cached:
-            # print(f"Cache Hit for {route_id}") # Debug
             return cached
             
-        print(f"Cache Miss for {route_id}, fetching...")
+        logger.debug(f"Cache miss for {route_id}, fetching...")
         data = fetch_func(route_id)
         
         if data:
             _route_cache[route_id] = data
             
         return data
+

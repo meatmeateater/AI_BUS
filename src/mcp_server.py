@@ -3,17 +3,23 @@ import json
 import os
 import difflib
 import logging
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-# Import local modules
-# Hack to make imports work when running from script
+# Ensure project root is in sys.path for module resolution
+# Preferred: run with `python -m src.mcp_server` from project root
+# This fallback handles direct `python src/mcp_server.py` invocations
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from src.crawler_core import BusCrawler
 from src.cache_manager import CacheManager
-
 from src.graph_engine import GraphEngine
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 # Config
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +35,7 @@ if os.path.exists(ROUTES_MAP_FILE):
     with open(ROUTES_MAP_FILE, 'r', encoding='utf-8') as f:
         routes_map = json.load(f)
 else:
-    logging.warning(f"Routes map not found at {ROUTES_MAP_FILE}")
+    logger.warning(f"Routes map not found at {ROUTES_MAP_FILE}")
 
 # Initialize Graph Engine
 graph_engine = GraphEngine(GRAPH_FILE)
@@ -73,7 +79,6 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
              return f"找不到路線：{route_name}"
 
     # 2. Fetch Data (Cached)
-    # We pass real_route_name to BusCrawler.get_route_data
     data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
     if not data:
         return f"無法取得 {real_route_name} 的即時資料，請稍後再試。"
@@ -107,16 +112,19 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
                      status_text = f"預計 {next_dep} 發車"
                 elif eta is not None:
                      eta_val = int(eta)
-                     if eta_val < 0:
-                         # Special codes based on observed JS
-                         if eta_val == 65535 or eta_val == 65529:
-                             status_text = "尚未發車"
-                         elif eta_val == -2:
-                             status_text = "已過站"
-                         elif eta_val == -3:
-                             status_text = "末班車已過" # Or Pit
-                         else:
-                             status_text = "末班車已過"
+                     # TDX StopStatus 已在 crawler_core 轉換：
+                     # 65535 / 65529 = 尚未發車 (正數)
+                     # -2 = 已過站
+                     # -3 = 末班車已過
+                     # >= 0 正常值 (秒數)
+                     if eta_val == 65535 or eta_val == 65529:
+                         status_text = "尚未發車"
+                     elif eta_val == -2:
+                         status_text = "已過站"
+                     elif eta_val == -3:
+                         status_text = "末班車已過"
+                     elif eta_val < 0:
+                         status_text = "末班車已過"
                      elif eta_val <= 180:
                          status_text = "即將進站"
                      else:
@@ -125,10 +133,6 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
                 else:
                     status_text = "無資料"
                 
-                # Append to results
-                vehicle_info = ""
-                # Could add vehicle plate if available in future
-                
                 found_stops.append(f"往 {dir_name}：{s_name} - {status_text}")
 
     if not found_stops:
@@ -136,28 +140,23 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
 
     return f"【{real_route_name}】目前狀態：\n" + "\n".join(found_stops)
 
-from datetime import datetime, timedelta
 
-def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple[bool, str, float]:
+def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple:
     """
     Check if a transfer is safe based on Frequency or Schedule.
-    Returns: (is_safe, reason, added_wait_cost_minutes)
+    Returns: (is_safe: bool, reason: str, added_wait_cost_minutes: float)
     """
     client = BusCrawler.get_client()
     if not client:
-        return True, "無法驗證 (API Error)", 0 # Fail open or closed? Open for now.
+        return True, "無法驗證 (API Error)", 0
 
     # 1. Check Frequency (High Freq)
     try:
         freqs = client.get_route_frequency(route_name)
         if freqs:
-            # Assuming first element represents general stat. 
-            # Real logic should match day type/time, but simplistic first.
             f = freqs[0] 
-            # Check ServiceDay? TDX returns current applicable usually?
-            # MinHeadwayMins
             min_h = f.get("MinHeadwayMins", 999)
-            if min_h <= 20: # 20 mins or less is considered frequent enough
+            if min_h <= 20:
                 return True, f"班次密集 (約 {min_h}分一班)", min_h / 2
     except Exception as e:
         logger.warning(f"Freq check fail: {e}")
@@ -166,33 +165,16 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
     try:
         scheds = client.get_schedule(route_name)
         if not scheds:
-             return False, "無班表資料", 30 # Penalty
-             
-        # Filter for trips after estimated_arrival
+             return False, "無班表資料", 30
+
         valid_trips = []
         arrival_str = estimated_arrival.strftime("%H:%M")
         
         for ch in scheds:
-            # Direction? We don't know direction easily without complex graphing.
-            # We assume if ANY direction has trips, it's usable (Optimistic).
-            # "Frequence" stops usually have trips both ways.
-            
-            # Times are in 'Frequencies' list? No, get_schedule returns "StopOfRoute"? 
-            # No, /Schedule/City returns "BusSchedule" structure with "Frequencys" or "Timetables"?
-            # Actually TDX /Schedule returns list of Route Schedules, containing "Timetables" or "Frequencies".
-            # My `get_schedule` calls `/Schedule`.
-            # Structure: [ { RouteName:..., Timetables: [ { TripID, StopTimes: [...] } ] } ]
-            # Wait, /Bus/Schedule/ is complex.
-            # Simplified: Just count TOTAL trips remaining in day? No.
-            
-            # Let's rely on Frequency if available. If not, assume it's low freq.
-            # If get_schedule return implies Timetable...
             timetables = ch.get("Timetables", [])
             for t in timetables:
-                # trip time? usually first stop time? 
                 stops = t.get("StopTimes", [])
                 if stops:
-                    # just take first stop dep time as approx trip time
                     dep_time = stops[0].get("DepartureTime", "00:00")
                     if dep_time > arrival_str:
                          valid_trips.append(dep_time)
@@ -201,10 +183,7 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
         count = len(valid_trips)
         
         if count >= 2:
-            # Calculat wait time for next bus
-            # simple diff
             next_bus = valid_trips[0]
-            # parse
             nb_h, nb_m = map(int, next_bus.split(':'))
             ea_h, ea_m = estimated_arrival.hour, estimated_arrival.minute
             wait = (nb_h * 60 + nb_m) - (ea_h * 60 + ea_m)
@@ -212,7 +191,7 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
             
             return True, f"表定尚有 {count} 班車 (下班 {next_bus})", wait
         elif count == 1:
-            return True, "僅剩 1 班車 (注意轉乘風險)", 60 # Penalty for risk
+            return True, "僅剩 1 班車 (注意轉乘風險)", 60
             
         return False, "已無合適班次 (末班已過或極少)", 999
         
@@ -221,20 +200,11 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
         
     return False, "資料無法判讀", 30
 
-@mcp.tool()
-def plan_trip(start: str, end: str) -> str:
-    """
-    規劃公車路線 (A站 到 B站)，依據「最快時間」與「安全轉乘」推薦。
-    
-    Args:
-       start: 起點站牌名稱
-       end: 終點站牌名稱
-    """
-    
+
 def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     """
     Core logic to find best route with real-time data.
-    Returns the best candidate object or None.
+    Returns the best candidate object or error dict.
     """
     candidates = graph_engine.find_candidate_paths(start, end, top_k=5)
     
@@ -249,7 +219,6 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         seg1 = cand["segments"][0]
         route_name = seg1["route"]
         stop_from = seg1["from"]
-        stop_to_1 = seg1["to"]
         
         # 1. Fetch Real-time ETA for First Leg
         real_route_name = find_canonical_route_name(route_name)
@@ -277,15 +246,24 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
                 wait_text = f"{int(wait_time)} 分鐘"
             else:
                 wait_text = "目前無車"
-                wait_time = 60 # Penalty
-        
+                wait_time = 60
+
         # Total Score
-        # For Direct: Static(Full) + Wait
-        # For Greedy Transfer: Static(Leg1) + Wait
         total_time = cand["static_time"] + wait_time
+        
+        # Check transfer safety if applicable
+        safety_note = ""
+        if cand["type"] == "transfer_greedy" and cand.get("transfer_stop"):
+            estimated_arrival_at_mid = current_time + timedelta(minutes=cand["static_time"] + wait_time)
+            # Find second leg route (if we have full path info)
+            is_safe, reason, extra_wait = check_transfer_safety(route_name, estimated_arrival_at_mid)
+            safety_note = f"({reason})"
+            if not is_safe:
+                total_time += extra_wait
         
         cand["total_time"] = total_time
         cand["wait_text"] = wait_text
+        cand["safety_note"] = safety_note
         ranked_results.append(cand)
 
     # Sort by Total Time
@@ -295,6 +273,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         return {"error": "No reachable route with data"}
         
     return ranked_results[0]
+
 
 @mcp.tool()
 def plan_trip(start: str, end: str) -> str:
@@ -322,44 +301,15 @@ def plan_trip(start: str, end: str) -> str:
     elif best["type"] == "transfer_greedy":
         s1 = best["segments"][0]
         mid = best["transfer_stop"]
-        response += f"\n👉 需轉乘 (分段導航)\n"
+        safety = best.get("safety_note", "")
+        response += f"\n👉 需轉乘 (分段導航) {safety}\n"
         response += f"1. 先搭乘【{s1['route']}】從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
         response += f"   坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)\n"
         response += f"\n⚠️ **重要**：這是最快能帶您離開起點並接近終點的路線。\n"
         response += f"   抵達 [{mid}] 後，請再次詢問我『{mid} 到 {end} 怎麼轉車』以獲取最新動態。\n"
         
     return response
-    
-    # Format Response
-    response = f"🚀 最快路線建議 (預估總時程: {int(best['total_time'])} 分鐘)\n"
-    
-    if best["type"] == "direct":
-        seg = best["segments"][0]
-        response += f"\n👉 請搭乘【{seg['route']}】(直達)\n"
-        response += f"   從 [{seg['from']}] 上車 (等候: {best['wait_text']})\n"
-        response += f"   抵達 [{seg['to']}] \n"
-        
-    elif best["type"] == "transfer":
-        s1 = best["segments"][0]
-        s2 = best["segments"][1]
-        mid = best["transfer_stop"]
-        response += f"\n👉 需轉乘 1 次\n"
-        response += f"1. 搭乘【{s1['route']}】從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
-        response += f"   坐到 [{mid}] 下車\n"
-        response += f"2. 轉乘【{s2['route']}】{best['safety_note']}\n"
-        response += f"   抵達 [{s2['to']}]\n"
-        response += f"\n⚠️ **重要**：抵達 [{mid}] 後，請再次詢問我以取得最新接博動態。\n"
-        
-    if len(ranked_results) > 1:
-        second = ranked_results[1]
-        diff = second["total_time"] - best["total_time"]
-        if diff < 10:
-            note = ""
-            if second["type"] == "transfer":
-                note = second.get("safety_note", "")
-            response += f"\n💡 替代方案: 搭 {second['segments'][0]['route']} ({note}) 差不多快 (+{int(diff)}分)"
-            
-    return response
+
 
 if __name__ == "__main__":
     mcp.run()

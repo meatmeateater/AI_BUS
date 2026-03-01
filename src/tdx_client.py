@@ -7,8 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TDXClient:
@@ -108,6 +106,23 @@ class TDXClient:
         }
         return self._make_request(url, params)
 
+    def get_estimated_arrival(self, route_name: str, city: str = "Taipei") -> List[Dict[str, Any]]:
+        """
+        Fetch estimated time of arrival for a specific route.
+        API: /EstimatedTimeOfArrival/City/{City}/{RouteName}
+        
+        Returns list of dicts with keys like:
+        - StopUID, StopName, RouteName, Direction
+        - EstimateTime (seconds until arrival, may be null)
+        - StopStatus (0:Normal, 1:NotStarted, 2:Past, 3:Pit)
+        - NextBusTime (ISO datetime string, may be null)
+        """
+        url = f"{self.API_BASE_URL}/EstimatedTimeOfArrival/City/{city}/{route_name}"
+        params = {
+            "$format": "JSON"
+        }
+        return self._make_request(url, params)
+
     def get_realtime_vehicle(self, route_name: Optional[str] = None, city: str = "Taipei") -> List[Dict[str, Any]]:
         """
         Fetch real-time vehicle positions (A1).
@@ -136,7 +151,7 @@ class TDXClient:
                 # TDX sometimes returns detailed error messages in JSON
                 try:
                     logger.error(f"TDX Error: {e.response.json()}")
-                except:
+                except Exception:
                     logger.error(f"Response text: {e.response.text}")
             return []
 

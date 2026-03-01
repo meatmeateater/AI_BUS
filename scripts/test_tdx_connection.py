@@ -1,11 +1,15 @@
+"""
+test_tdx_connection.py — TDX API 連線與基本功能驗證
+"""
 import sys
 import os
 import json
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+# Add project root to path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from tdx_client import TDXClient
+from src.tdx_client import TDXClient
+
 
 def test_tdx():
     print("Initializing TDX Client...")
@@ -15,38 +19,47 @@ def test_tdx():
         # 1. Test Auth
         print("\n--- Testing Authentication ---")
         client._authenticate()
-        print("Authentication Verified.")
+        print("✅ Authentication Verified.")
         
-        # 2. Test Get Routes (Taipei - 307)
-        print("\n--- Testing Get Routes (307) ---")
-        # Note: TDX RouteName is usually an object {"Zh_tw": "...", "En": "..."}
-        # But the API call might just take the string "307" if filtering on client side or specialized endpoint
-        # The generic get_routes gets ALL routes, so we filter locally for the test.
-        # Alternatively use OData $filter if we wanted to be fancy, but let's stick to Python filtering for simplicity.
-        
-        # Doing a specific route fetch using get_stops as a proxy for "does this route exist" is easier
-        # Or using the specific route endpoint if available.
-        # Let's try get_stops for 307
+        # 2. Test Get Stops (307)
+        print("\n--- Testing Get Stops (307) ---")
         stops = client.get_stops(route_name="307", city="Taipei")
         if stops:
-            print(f"Successfully fetched {len(stops)} stops for route 307.")
-            print(f"Sample stop: {stops[0].get('StopName', {}).get('Zh_tw')}")
+            print(f"✅ Successfully fetched {len(stops)} direction entries for route 307.")
+            first_dir = stops[0]
+            dir_stops = first_dir.get("Stops", [])
+            if dir_stops:
+                print(f"   First stop: {dir_stops[0].get('StopName', {}).get('Zh_tw')}")
         else:
-            print("Failed to fetch stops for 307 (or empty).")
+            print("❌ Failed to fetch stops for 307 (or empty).")
             
         # 3. Test ETA
         print("\n--- Testing ETA (307) ---")
         etas = client.get_estimated_arrival(route_name="307", city="Taipei")
         if etas:
-            print(f"Successfully fetched {len(etas)} ETA records.")
-            print(f"Sample ETA: {etas[0].get('StopName', {}).get('Zh_tw')} - {etas[0].get('EstimateTime')}s")
+            print(f"✅ Successfully fetched {len(etas)} ETA records.")
+            sample = etas[0]
+            print(f"   Sample: {sample.get('StopName', {}).get('Zh_tw')} - "
+                  f"EstimateTime={sample.get('EstimateTime')}s, "
+                  f"StopStatus={sample.get('StopStatus')}")
         else:
-            print("Failed to fetch ETAs (maybe off hours?).")
+            print("⚠️ No ETA data (maybe off-hours or no buses running).")
+
+        # 4. Test Frequency
+        print("\n--- Testing Route Frequency (307) ---")
+        freqs = client.get_route_frequency(route_name="307", city="Taipei")
+        if freqs:
+            print(f"✅ Successfully fetched {len(freqs)} frequency records.")
+        else:
+            print("⚠️ No frequency data.")
+
+        print("\n--- All Tests Passed ---")
 
     except Exception as e:
-        print(f"\n[ERROR] Test Failed: {e}")
+        print(f"\n❌ [ERROR] Test Failed: {e}")
         import traceback
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     test_tdx()

@@ -3,7 +3,7 @@ import sys
 import json
 import time
 import logging
-from typing import Dict, List, Set
+from typing import Dict, List
 
 # Setup paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +16,10 @@ ROUTES_MAP_FILE = os.path.join(BASE_DIR, 'data', 'static', 'routes_map.json')
 GRAPH_FILE = os.path.join(BASE_DIR, 'data', 'static', 'bus_graph.json')
 LOG_DIR = os.path.join(BASE_DIR, 'data', 'logs')
 
-# Setup logging
+# Ensure log directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Setup logging (this is a standalone script, so basicConfig is appropriate here)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,18 +29,21 @@ logging.basicConfig(
     ]
 )
 
+logger = logging.getLogger(__name__)
+
+
 def build_graph():
-    logging.info("Starting graph builder...")
+    logger.info("Starting graph builder...")
     
     # 1. Load routes map
     if not os.path.exists(ROUTES_MAP_FILE):
-        logging.error(f"Routes map not found at {ROUTES_MAP_FILE}")
+        logger.error(f"Routes map not found at {ROUTES_MAP_FILE}")
         return
 
     with open(ROUTES_MAP_FILE, 'r', encoding='utf-8') as f:
-        routes_map = json.load(f) # {"Name": "ID"}
+        routes_map = json.load(f)  # {"Name": "ID"}
 
-    logging.info(f"Loaded {len(routes_map)} routes.")
+    logger.info(f"Loaded {len(routes_map)} routes.")
 
     # Data structures
     # stops: { "StopName": { "routes": ["RouteName"] } }
@@ -51,27 +57,16 @@ def build_graph():
     
     for route_name, route_id in routes_map.items():
         count += 1
-        print(f"[{count}/{total}] Processing {route_name} ({route_id})...")
+        logger.info(f"[{count}/{total}] Processing {route_name} ({route_id})...")
         
-        # Fetch static data only
-        data = BusCrawler.get_route_data(route_id, only_static=True)
+        # Fetch static data only (skip real-time ETA)
+        data = BusCrawler.get_route_data(route_name, only_static=True)
         
         if not data:
-            logging.warning(f"Failed to fetch data for {route_name}")
+            logger.warning(f"Failed to fetch data for {route_name}")
             continue
-            
-        # Process stops
-        # We need to capture both directions but treat them carefully.
-        # For simplicity in navigation Plan V1, we will just list all stations this route passes through.
-        # Ideally, we should separate directions, but graph logic can handle "Reachability".
-        
-        # Merge stops from both directions for the "Route coverage" list
-        unique_stops_in_route = []
-        
-        # We also want to record directionality, but for V1 BFS, let's keep it undirected or simple directed.
-        # Let's save the simplified list of stops for this route first.
-        
-        # Combine lists
+
+        # Combine stops from both directions
         all_stops = []
         if "GoDirStops" in data and data["GoDirStops"]:
              all_stops.extend(data["GoDirStops"])
@@ -83,33 +78,20 @@ def build_graph():
             if not s_name:
                 continue
             
-            # Update Routes Data
-            # (Wait, Graph connection needs Order. But for "Transfer", we just need to know "Route X goes to Station Y")
-            # If I am at Station A, and I want to go to Station B.
-            # I find routes at A: [R1, R2]
-            # I find routes at B: [R2, R3]
-            # Intersection: R2. So take R2.
-            # This "Set Intersection" logic works without knowing the order, 
-            # AS LONG AS R2 actually goes A -> B. (This is the catch, direction matters)
-            # But usually bus routes are loops or bi-directional. 
-            # For V1, we assume if a bus stops at A and B, it connects them. (Roughly true)
-            
             if route_name not in routes_data:
                 routes_data[route_name] = []
             if s_name not in routes_data[route_name]:
                 routes_data[route_name].append(s_name)
 
-            # Update Stops Index
             if s_name not in stops_index:
                 stops_index[s_name] = {"routes": []}
             
             if route_name not in stops_index[s_name]["routes"]:
                 stops_index[s_name]["routes"].append(route_name)
 
-        # Sleep slightly to be nice
-        # time.sleep(0.1) 
-
     # Save to file
+    os.makedirs(os.path.dirname(GRAPH_FILE), exist_ok=True)
+    
     graph_output = {
         "stops": stops_index,
         "routes": routes_data,
@@ -119,8 +101,8 @@ def build_graph():
     with open(GRAPH_FILE, 'w', encoding='utf-8') as f:
         json.dump(graph_output, f, ensure_ascii=False, indent=2)
         
-    logging.info(f"Graph built! Saved {len(stops_index)} stops and {len(routes_data)} routes to {GRAPH_FILE}")
-    print(f"Graph building complete. File saved to {GRAPH_FILE}")
+    logger.info(f"Graph built! Saved {len(stops_index)} stops and {len(routes_data)} routes to {GRAPH_FILE}")
+
 
 if __name__ == "__main__":
     build_graph()
