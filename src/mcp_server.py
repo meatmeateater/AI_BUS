@@ -222,11 +222,11 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         route_key = seg1["route"]           # e.g. "307__go"
         base_route = get_base_route_name(route_key)  # e.g. "307"
         stop_from = seg1["from"]
+        stop_from_uid = seg1.get("from_uid")  # P1: StopUID for precise matching
         
         # 1. Fetch Real-time ETA for First Leg
         real_route_name = find_canonical_route_name(base_route)
         if not real_route_name:
-            # Fallback: try base_route directly if routes_map is empty
             if not routes_map:
                 real_route_name = base_route
             else:
@@ -246,11 +246,17 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
             elif route_key.endswith(DIR_BACK):
                 dir_stops = data.get("BackDirStops", [])
             else:
-                # Fallback: search both
                 dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
             
             for s in dir_stops:
-                if stop_from in s.get("Name", ""):
+                # P1: Prefer StopUID matching (exact), fallback to name matching
+                matched = False
+                if stop_from_uid and s.get("StopUID"):
+                    matched = s["StopUID"] == stop_from_uid
+                else:
+                    matched = stop_from in s.get("Name", "")
+                
+                if matched:
                     e = s.get("ETA")
                     if e is not None and int(e) >= 0:
                         valid_etas.append(int(e))

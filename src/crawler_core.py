@@ -81,10 +81,12 @@ class BusCrawler:
                 for stop in stops:
                     uid = stop.get("StopUID")
                     name = stop.get("StopName", {}).get("Zh_tw", "Unknown")
+                    position = stop.get("StopPosition", {})
                     
                     stop_info: Dict[str, Any] = {
                         "Name": name,
                         "StopUID": uid,
+                        "StopPosition": position,
                         "ETA": None,
                         "NextDepTime": None
                     }

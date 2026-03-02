@@ -3,7 +3,7 @@ import sys
 import json
 import time
 import logging
-from typing import Dict, List
+from typing import Dict, List, Any
 
 # Setup paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,10 +16,8 @@ ROUTES_MAP_FILE = os.path.join(BASE_DIR, 'data', 'static', 'routes_map.json')
 GRAPH_FILE = os.path.join(BASE_DIR, 'data', 'static', 'bus_graph.json')
 LOG_DIR = os.path.join(BASE_DIR, 'data', 'logs')
 
-# Ensure log directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Setup logging (standalone script)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -28,18 +26,15 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
 
-# Direction suffixes for route keys
 DIR_GO = "__go"
 DIR_BACK = "__back"
 
 
 def build_graph():
-    logger.info("Starting graph builder (direction-aware)...")
+    logger.info("Starting graph builder (v3: direction-aware + UID + GPS)...")
     
-    # 1. Load routes map
     if not os.path.exists(ROUTES_MAP_FILE):
         logger.error(f"Routes map not found at {ROUTES_MAP_FILE}")
         return
@@ -50,12 +45,13 @@ def build_graph():
     logger.info(f"Loaded {len(routes_map)} routes.")
 
     # Data structures
-    # stops: { "StopName": { "routes": ["307__go", "307__back", ...] } }
-    # routes_data: { "307__go": ["StopName1", "StopName2", ...],
-    #                "307__back": ["StopNameA", "StopNameB", ...] }
+    # stops: { "StopName": { "routes": ["307__go", ...], "lat": float, "lon": float } }
+    # routes: { "307__go": ["StopName1", "StopName2", ...] }
+    # stop_uid_map: { "route_key": { "StopName": "StopUID" } }
     
-    stops_index: Dict[str, Dict[str, List[str]]] = {}
+    stops_index: Dict[str, Dict[str, Any]] = {}
     routes_data: Dict[str, List[str]] = {}
+    stop_uid_map: Dict[str, Dict[str, str]] = {}  # P1: UID 映射
 
     count = 0
     total = len(routes_map)
@@ -64,14 +60,12 @@ def build_graph():
         count += 1
         logger.info(f"[{count}/{total}] Processing {route_name}...")
         
-        # Fetch static data only (skip real-time ETA)
         data = BusCrawler.get_route_data(route_name, only_static=True)
         
         if not data:
             logger.warning(f"Failed to fetch data for {route_name}")
             continue
 
-        # Process each direction separately
         directions = [
             (DIR_GO, data.get("GoDirStops", [])),
             (DIR_BACK, data.get("BackDirStops", []))
@@ -81,32 +75,48 @@ def build_graph():
             if not dir_stops:
                 continue
                 
-            route_key = route_name + dir_suffix  # e.g. "307__go"
+            route_key = route_name + dir_suffix
             routes_data[route_key] = []
+            stop_uid_map[route_key] = {}
             
             for stop in dir_stops:
                 s_name = stop.get("Name")
+                s_uid = stop.get("StopUID")
                 if not s_name:
                     continue
                 
-                # Maintain order (append, don't deduplicate — preserves stop sequence)
+                # 路線站序
                 routes_data[route_key].append(s_name)
+                
+                # P1: UID 映射 (route_key -> stop_name -> StopUID)
+                if s_uid:
+                    stop_uid_map[route_key][s_name] = s_uid
 
-                # Update stops index
+                # 站點索引
                 if s_name not in stops_index:
                     stops_index[s_name] = {"routes": []}
                 
                 if route_key not in stops_index[s_name]["routes"]:
                     stops_index[s_name]["routes"].append(route_key)
+                
+                # P2: GPS 座標 (取第一次遇到的值)
+                if "lat" not in stops_index[s_name]:
+                    pos = stop.get("StopPosition", {})
+                    lat = pos.get("PositionLat")
+                    lon = pos.get("PositionLon")
+                    if lat and lon:
+                        stops_index[s_name]["lat"] = lat
+                        stops_index[s_name]["lon"] = lon
 
-    # Save to file
+    # Save
     os.makedirs(os.path.dirname(GRAPH_FILE), exist_ok=True)
     
     graph_output = {
         "stops": stops_index,
         "routes": routes_data,
+        "stop_uid_map": stop_uid_map,
         "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "version": 2,
+        "version": 3,
         "direction_aware": True
     }
     
