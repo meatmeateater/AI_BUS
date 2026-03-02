@@ -95,20 +95,59 @@ class GraphEngine:
                               ref_lat: Optional[float] = None,
                               ref_lon: Optional[float] = None) -> Optional[str]:
         """
-        Find best matching stop name.
-        If GPS coordinates are provided, uses distance to disambiguate among candidates.
+        Find best matching stop name with normalization and fuzzy matching.
+        
+        Strategy:
+        1. Exact match
+        2. Normalized exact match (台↔臺, 車站→station variants)
+        3. Substring match on normalized names
+        4. GPS-based disambiguation if coordinates provided
         """
         if not self.is_loaded:
             self.load_graph()
 
         if query in self.stops:
             return query
-            
-        # Partial match
-        candidates = [s for s in self.stops.keys() if query in s]
+        
+        # Normalize query: expand common variants
+        normalized_queries = self._normalize_stop_name(query)
+        
+        # Try exact match with normalized variants
+        for nq in normalized_queries:
+            if nq in self.stops:
+                return nq
+        
+        # Substring match with all normalized variants
+        candidates = set()
+        for nq in normalized_queries:
+            for s in self.stops:
+                if nq in s:
+                    candidates.add(s)
+        
         if not candidates:
             return None
         
+        candidate_list = list(candidates)
+        
+        # Scoring: lower = better
+        def match_score(stop_name: str) -> tuple:
+            """
+            Sort priority:
+            1. query starts the stop name (prefix match) → score 0
+            2. any normalized variant starts the stop name → score 1
+            3. substring match only → score 2
+            Then by: route count (more routes = bigger station = better, negative for desc)
+            Then by: name length (shorter = more specific)
+            """
+            tier = 2
+            for nq in normalized_queries:
+                if stop_name.startswith(nq):
+                    tier = 0 if nq == query else 1
+                    break
+            
+            route_count = len(self.stops.get(stop_name, {}).get("routes", []))
+            return (tier, -route_count, len(stop_name))
+
         # P2: If GPS is available, sort by distance to reference point
         if ref_lat is not None and ref_lon is not None:
             def distance_to_ref(stop_name: str) -> float:
@@ -118,12 +157,52 @@ class GraphEngine:
                     return haversine_distance(ref_lat, ref_lon, lat, lon)
                 return float('inf')
             
-            candidates.sort(key=distance_to_ref)
-            return candidates[0]
+            candidate_list.sort(key=distance_to_ref)
+            return candidate_list[0]
         
-        # Fallback: pick shortest name (most generic)
-        candidates.sort(key=len)
-        return candidates[0]
+        # Fallback: use match_score (prefix match > substring, more routes = better)
+        candidate_list.sort(key=match_score)
+        return candidate_list[0]
+    
+    @staticmethod
+    def _normalize_stop_name(query: str) -> List[str]:
+        """
+        Generate normalized variants of a stop name query.
+        Handles: 台↔臺, common abbreviations, MRT station prefixes.
+        """
+        variants = [query]
+        
+        # 台 ↔ 臺 互轉
+        if "台" in query:
+            variants.append(query.replace("台", "臺"))
+        if "臺" in query:
+            variants.append(query.replace("臺", "台"))
+        
+        # 線 → 幹線 (e.g. "民權線" -> "民權幹線")
+        # 不做，避免誤判
+        
+        # 嘗試加上「捷運」前綴 (e.g. "西門站" -> "捷運西門站")
+        extra = []
+        for v in variants:
+            if not v.startswith("捷運"):
+                extra.append("捷運" + v)
+                # 也嘗試加站字尾
+                if not v.endswith("站"):
+                    extra.append("捷運" + v + "站")
+            if not v.endswith("站"):
+                extra.append(v + "站")
+        
+        variants.extend(extra)
+        
+        # 去重但保持順序 (原始 query 優先)
+        seen = set()
+        result = []
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                result.append(v)
+        
+        return result
 
     def get_stop_uid(self, route_key: str, stop_name: str) -> Optional[str]:
         """P1: Get StopUID for a specific stop on a specific route."""
@@ -197,9 +276,35 @@ class GraphEngine:
             
         return stops[best_s : best_e + 1]
 
+    def _expand_stop_group(self, stop_name: str) -> List[str]:
+        """
+        Expand a stop to all sibling sub-stations.
+        e.g. '臺北車站(忠孝)' -> ['臺北車站(忠孝)', '臺北車站(承德)', '臺北車站(鄭州)', ...]
+        For stops without parenthetical suffix, returns just [stop_name].
+        """
+        if "(" not in stop_name:
+            # Check if there are sibling stops with parenthetical suffixes
+            siblings = [s for s in self.stops if s.startswith(stop_name + "(")]
+            if siblings:
+                return [stop_name] + siblings
+            return [stop_name]
+        
+        # Extract base name: '臺北車站(忠孝)' -> '臺北車站'
+        base = stop_name.split("(")[0]
+        siblings = [s for s in self.stops if s.startswith(base + "(") or s == base]
+        return siblings if siblings else [stop_name]
+    
+    def _get_merged_routes(self, stop_group: List[str]) -> set:
+        """Get union of all routes from a group of stops."""
+        routes = set()
+        for s in stop_group:
+            routes.update(self.stops.get(s, {}).get("routes", []))
+        return routes
+
     def find_candidate_paths(self, start: str, end: str, top_k: int = 5) -> List[Dict]:
         """
         Find candidates using Greedy Hop Strategy (direction-aware, with UID).
+        Expands station groups (e.g. all 台北車站 sub-stations) for broader coverage.
         """
         if not self.is_loaded:
             self.load_graph()
@@ -209,30 +314,43 @@ class GraphEngine:
         
         if not real_start or not real_end:
             return []
-            
-        start, end = real_start, real_end
+        
+        # Expand to sibling sub-stations
+        start_group = self._expand_stop_group(real_start)
+        end_group = self._expand_stop_group(real_end)
+        
         candidates = []
-
         TIME_PER_STOP = 2.5
         
-        start_routes = set(self.stops.get(start, {}).get("routes", []))
-        end_routes = set(self.stops.get(end, {}).get("routes", []))
+        # Merge routes from all sub-stations
+        start_routes = self._get_merged_routes(start_group)
+        end_routes = self._get_merged_routes(end_group)
         
         # --- Priority 1: Direct ---
         common_routes = start_routes.intersection(end_routes)
         
         for r in common_routes:
-            dist = self.get_route_stop_distance(r, start, end)
-            if dist < 900: 
-                est_time = dist * TIME_PER_STOP
-                # P1: Include StopUID for precise ETA matching
-                start_uid = self.get_stop_uid(r, start)
+            # Try all start_sub × end_sub combinations to find valid pairs
+            best_dist = 999
+            best_from = None
+            best_to = None
+            for s in start_group:
+                for e in end_group:
+                    dist = self.get_route_stop_distance(r, s, e)
+                    if 0 < dist < best_dist:
+                        best_dist = dist
+                        best_from = s
+                        best_to = e
+            
+            if best_dist < 900 and best_from and best_to:
+                est_time = best_dist * TIME_PER_STOP
+                start_uid = self.get_stop_uid(r, best_from)
                 candidates.append({
                     "type": "direct",
-                    "segments": [{"route": r, "from": start, "to": end,
+                    "segments": [{"route": r, "from": best_from, "to": best_to,
                                   "from_uid": start_uid}],
                     "static_time": est_time,
-                    "stop_count": dist
+                    "stop_count": best_dist
                 })
         
         if candidates:
@@ -253,19 +371,23 @@ class GraphEngine:
         common_transfer_stops = stops_from_start.intersection(stops_from_end)
         
         for mid in common_transfer_stops:
-            if mid == start or mid == end:
+            if mid in start_group or mid in end_group:
                 continue
             
             r1_candidates = [r for r in start_routes if mid in self._stop_index.get(r, {})]
             
             best_r1 = None
+            best_from = None
             min_d1 = 999
             
             for r in r1_candidates:
-                d = self.get_route_stop_distance(r, start, mid)
-                if d < min_d1:
-                    min_d1 = d
-                    best_r1 = r
+                # Find best sub-station from start_group for this route
+                for sg in start_group:
+                    d = self.get_route_stop_distance(r, sg, mid)
+                    if d < min_d1:
+                        min_d1 = d
+                        best_r1 = r
+                        best_from = sg
             
             if min_d1 >= 900 or not best_r1:
                 continue
@@ -277,10 +399,11 @@ class GraphEngine:
             min_d2 = 999
             
             for r in r2_candidates:
-                d = self.get_route_stop_distance(r, mid, end)
-                if d < min_d2:
-                    min_d2 = d
-                    best_r2 = r
+                for eg in end_group:
+                    d = self.get_route_stop_distance(r, mid, eg)
+                    if d < min_d2:
+                        min_d2 = d
+                        best_r2 = r
             
             if not best_r2:
                 continue
@@ -288,12 +411,12 @@ class GraphEngine:
             est_time_leg1 = min_d1 * TIME_PER_STOP
             est_time_leg2 = min_d2 * TIME_PER_STOP if min_d2 < 900 else 0
             
-            start_uid = self.get_stop_uid(best_r1, start)
+            start_uid = self.get_stop_uid(best_r1, best_from)
             candidates.append({
                 "type": "transfer_greedy",
                 "transfer_stop": mid,
                 "segments": [
-                    {"route": best_r1, "from": start, "to": mid,
+                    {"route": best_r1, "from": best_from, "to": mid,
                      "from_uid": start_uid}
                 ],
                 "transfer_route": best_r2,
@@ -326,26 +449,29 @@ class GraphEngine:
                 
                 best_m1 = None
                 best_r1 = None
+                best_from_bridge = None
                 min_time_to_m1 = 9999
                 
                 for m1 in m1_candidates:
                      valid_r1s = [r for r in start_routes if m1 in self._stop_index.get(r, {})]
                      for r in valid_r1s:
-                         d = self.get_route_stop_distance(r, start, m1)
-                         if d < 900:
-                             t = d * TIME_PER_STOP
-                             if t < min_time_to_m1:
-                                 min_time_to_m1 = t
-                                 best_m1 = m1
-                                 best_r1 = r
+                         for sg in start_group:
+                             d = self.get_route_stop_distance(r, sg, m1)
+                             if d < 900:
+                                 t = d * TIME_PER_STOP
+                                 if t < min_time_to_m1:
+                                     min_time_to_m1 = t
+                                     best_m1 = m1
+                                     best_r1 = r
+                                     best_from_bridge = sg
                 
-                if best_m1 and best_r1:
-                    start_uid = self.get_stop_uid(best_r1, start)
+                if best_m1 and best_r1 and best_from_bridge:
+                    start_uid = self.get_stop_uid(best_r1, best_from_bridge)
                     candidates.append({
                         "type": "transfer_greedy",
                         "transfer_stop": best_m1,
                         "segments": [
-                            {"route": best_r1, "from": start, "to": best_m1,
+                            {"route": best_r1, "from": best_from_bridge, "to": best_m1,
                              "from_uid": start_uid}
                         ],
                         "transfer_route": bridge,

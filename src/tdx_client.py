@@ -139,21 +139,39 @@ class TDXClient:
         }
         return self._make_request(url, params)
 
-    def _make_request(self, url: str, params: Dict[str, Any]) -> Any:
-        try:
-            headers = self._get_auth_header()
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            logger.error(f"Request failed for {url}: {e}")
-            if e.response:
-                # TDX sometimes returns detailed error messages in JSON
-                try:
-                    logger.error(f"TDX Error: {e.response.json()}")
-                except Exception:
-                    logger.error(f"Response text: {e.response.text}")
-            return []
+    def _make_request(self, url: str, params: Dict[str, Any], max_retries: int = 3) -> Any:
+        for attempt in range(max_retries + 1):
+            try:
+                headers = self._get_auth_header()
+                response = requests.get(url, headers=headers, params=params)
+                
+                # Handle 429 Rate Limit with retry
+                if response.status_code == 429:
+                    if attempt < max_retries:
+                        wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                        logger.warning(f"Rate limited (429). Retry {attempt+1}/{max_retries} in {wait}s...")
+                        import time
+                        time.sleep(wait)
+                        continue
+                
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as e:
+                logger.error(f"Request failed for {url}: {e}")
+                if e.response is not None:
+                    try:
+                        logger.error(f"TDX Error: {e.response.json()}")
+                    except Exception:
+                        logger.error(f"Response text: {e.response.text}")
+                
+                # Retry on server errors (5xx)
+                if e.response is not None and e.response.status_code >= 500 and attempt < max_retries:
+                    import time
+                    time.sleep(2)
+                    continue
+                    
+                return []
+        return []
 
 if __name__ == "__main__":
     # Quick sanity check

@@ -64,7 +64,12 @@ def build_graph():
         
         if not data:
             logger.warning(f"Failed to fetch data for {route_name}")
+            # Rate limit backoff: if we failed, wait longer before next request
+            time.sleep(2)
             continue
+        
+        # Rate limit: pause between requests to avoid 429
+        time.sleep(3)
 
         directions = [
             (DIR_GO, data.get("GoDirStops", [])),
