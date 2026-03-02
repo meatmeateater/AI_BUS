@@ -294,6 +294,39 @@ class GraphEngine:
         siblings = [s for s in self.stops if s.startswith(base + "(") or s == base]
         return siblings if siblings else [stop_name]
     
+    def _expand_stop_group_full(self, original_query: str, matched_stop: str) -> List[str]:
+        """
+        Full expansion: parenthetical siblings + normalized variant matches.
+        
+        e.g. query='西門', matched='西門' ->
+            parenthetical: ['西門']  (no 西門(xxx) exists)
+            normalized variants: '捷運西門站' also exists in graph
+            result: ['西門', '捷運西門站']
+        
+        e.g. query='台北車站', matched='臺北車站(忠孝)' ->
+            parenthetical: ['臺北車站(忠孝)', '臺北車站(承德)', ...]
+            result: all 臺北車站(*) variants
+        """
+        # Start with parenthetical expansion
+        group = set(self._expand_stop_group(matched_stop))
+        
+        # Also expand using normalized variants of the original query
+        variants = self._normalize_stop_name(original_query)
+        for v in variants:
+            # Exact match
+            if v in self.stops:
+                group.add(v)
+                # Also expand that match's parenthetical siblings
+                for sib in self._expand_stop_group(v):
+                    group.add(sib)
+            # Prefix match for key transit stops
+            for s in self.stops:
+                if s.startswith(v) and len(s) - len(v) <= 5:
+                    # Only add if suffix is short (e.g. "(忠孝)" but not "國小附近")
+                    group.add(s)
+        
+        return list(group)
+    
     def _get_merged_routes(self, stop_group: List[str]) -> set:
         """Get union of all routes from a group of stops."""
         routes = set()
@@ -315,9 +348,9 @@ class GraphEngine:
         if not real_start or not real_end:
             return []
         
-        # Expand to sibling sub-stations
-        start_group = self._expand_stop_group(real_start)
-        end_group = self._expand_stop_group(real_end)
+        # Expand to sibling sub-stations (parenthetical + normalized variants)
+        start_group = self._expand_stop_group_full(start, real_start)
+        end_group = self._expand_stop_group_full(end, real_end)
         
         candidates = []
         TIME_PER_STOP = 2.5
