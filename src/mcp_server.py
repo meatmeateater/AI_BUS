@@ -204,8 +204,11 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
 def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     """
     Core logic to find best route with real-time data.
-    Returns the best candidate object or error dict.
+    Route keys from graph_engine are direction-aware (e.g. '307__go').
+    We strip the suffix when calling TDX API.
     """
+    from src.graph_engine import get_base_route_name, DIR_GO, DIR_BACK
+    
     candidates = graph_engine.find_candidate_paths(start, end, top_k=5)
     
     if not candidates:
@@ -215,15 +218,19 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     current_time = datetime.now()
     
     for cand in candidates:
-        # Get First Leg info
         seg1 = cand["segments"][0]
-        route_name = seg1["route"]
+        route_key = seg1["route"]           # e.g. "307__go"
+        base_route = get_base_route_name(route_key)  # e.g. "307"
         stop_from = seg1["from"]
         
         # 1. Fetch Real-time ETA for First Leg
-        real_route_name = find_canonical_route_name(route_name)
+        real_route_name = find_canonical_route_name(base_route)
         if not real_route_name:
-            continue
+            # Fallback: try base_route directly if routes_map is empty
+            if not routes_map:
+                real_route_name = base_route
+            else:
+                continue
             
         data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
         
@@ -232,13 +239,21 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         
         if data:
             valid_etas = []
-            dirs = [("Go", data.get("GoDirStops", [])), ("Back", data.get("BackDirStops", []))]
-            for d_name, stops in dirs:
-                for s in stops:
-                    if stop_from in s.get("Name", ""):
-                        e = s.get("ETA")
-                        if e is not None and int(e) >= 0:
-                            valid_etas.append(int(e))
+            
+            # Match ETA based on direction from route key
+            if route_key.endswith(DIR_GO):
+                dir_stops = data.get("GoDirStops", [])
+            elif route_key.endswith(DIR_BACK):
+                dir_stops = data.get("BackDirStops", [])
+            else:
+                # Fallback: search both
+                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
+            
+            for s in dir_stops:
+                if stop_from in s.get("Name", ""):
+                    e = s.get("ETA")
+                    if e is not None and int(e) >= 0:
+                        valid_etas.append(int(e))
                             
             if valid_etas:
                 wait_time_sec = min(valid_etas)
@@ -248,15 +263,17 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
                 wait_text = "目前無車"
                 wait_time = 60
 
-        # Total Score
-        total_time = cand["static_time"] + wait_time
+        # Total Score = wait + leg1 travel + estimated remaining (for fair comparison)
+        remaining = cand.get("remaining_time", 0)
+        total_time = cand["static_time"] + wait_time + remaining
         
-        # Check transfer safety if applicable
+        # Check transfer safety — use the TRANSFER route (leg 2), not leg 1
         safety_note = ""
-        if cand["type"] == "transfer_greedy" and cand.get("transfer_stop"):
+        if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
+            transfer_route_key = cand["transfer_route"]
+            transfer_base = get_base_route_name(transfer_route_key)
             estimated_arrival_at_mid = current_time + timedelta(minutes=cand["static_time"] + wait_time)
-            # Find second leg route (if we have full path info)
-            is_safe, reason, extra_wait = check_transfer_safety(route_name, estimated_arrival_at_mid)
+            is_safe, reason, extra_wait = check_transfer_safety(transfer_base, estimated_arrival_at_mid)
             safety_note = f"({reason})"
             if not is_safe:
                 total_time += extra_wait
@@ -264,9 +281,9 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         cand["total_time"] = total_time
         cand["wait_text"] = wait_text
         cand["safety_note"] = safety_note
+        cand["display_route"] = base_route  # Clean name for UI
         ranked_results.append(cand)
 
-    # Sort by Total Time
     ranked_results.sort(key=lambda x: x["total_time"])
     
     if not ranked_results:
@@ -285,6 +302,8 @@ def plan_trip(start: str, end: str) -> str:
        start: 起點站牌名稱
        end: 終點站牌名稱
     """
+    from src.graph_engine import get_base_route_name, get_direction_label
+    
     best = calculate_best_route(start, end)
     
     if "error" in best:
@@ -294,16 +313,22 @@ def plan_trip(start: str, end: str) -> str:
     
     if best["type"] == "direct":
         seg = best["segments"][0]
-        response += f"\n👉 請搭乘【{seg['route']}】(直達)\n"
+        route_display = get_base_route_name(seg['route'])
+        direction = get_direction_label(seg['route'])
+        dir_info = f" {direction}" if direction else ""
+        response += f"\n👉 請搭乘【{route_display}】{dir_info} (直達)\n"
         response += f"   從 [{seg['from']}] 上車 (等候: {best['wait_text']})\n"
         response += f"   抵達 [{seg['to']}] \n"
         
     elif best["type"] == "transfer_greedy":
         s1 = best["segments"][0]
+        route_display = get_base_route_name(s1['route'])
+        direction = get_direction_label(s1['route'])
+        dir_info = f" {direction}" if direction else ""
         mid = best["transfer_stop"]
         safety = best.get("safety_note", "")
         response += f"\n👉 需轉乘 (分段導航) {safety}\n"
-        response += f"1. 先搭乘【{s1['route']}】從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
+        response += f"1. 先搭乘【{route_display}】{dir_info} 從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
         response += f"   坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)\n"
         response += f"\n⚠️ **重要**：這是最快能帶您離開起點並接近終點的路線。\n"
         response += f"   抵達 [{mid}] 後，請再次詢問我『{mid} 到 {end} 怎麼轉車』以獲取最新動態。\n"
@@ -313,3 +338,4 @@ def plan_trip(start: str, end: str) -> str:
 
 if __name__ == "__main__":
     mcp.run()
+

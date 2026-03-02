@@ -1,6 +1,6 @@
 """
-tests/test_graph_engine.py — GraphEngine 單元測試
-使用 mock 的圖資料來測試路徑搜尋邏輯，不需要真實 API 連線。
+tests/test_graph_engine.py — GraphEngine 單元測試 (v2, direction-aware)
+使用 mock 的圖資料來測試路徑搜尋邏輯，不需要真實 API。
 """
 import os
 import sys
@@ -8,38 +8,60 @@ import json
 import tempfile
 import unittest
 
-# Setup path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.graph_engine import GraphEngine
+from src.graph_engine import GraphEngine, get_base_route_name, get_direction_label
+
+
+class TestHelpers(unittest.TestCase):
+    """Test helper functions."""
+    
+    def test_get_base_route_name_go(self):
+        self.assertEqual(get_base_route_name("307__go"), "307")
+    
+    def test_get_base_route_name_back(self):
+        self.assertEqual(get_base_route_name("復興幹線__back"), "復興幹線")
+    
+    def test_get_base_route_name_no_suffix(self):
+        self.assertEqual(get_base_route_name("307"), "307")
+    
+    def test_get_direction_label(self):
+        self.assertEqual(get_direction_label("307__go"), "去程")
+        self.assertEqual(get_direction_label("307__back"), "返程")
+        self.assertEqual(get_direction_label("307"), "")
 
 
 class TestGraphEngine(unittest.TestCase):
-    """GraphEngine 路徑搜尋測試"""
+    """GraphEngine 路徑搜尋測試 (direction-aware)"""
     
     @classmethod
     def setUpClass(cls):
-        """建立測試用的 mock 圖資料"""
+        """建立 direction-aware 的 mock 圖資料"""
         cls.mock_graph = {
             "stops": {
-                "台北車站": {"routes": ["307", "299"]},
-                "板橋站": {"routes": ["307", "藍線"]},
-                "中山站": {"routes": ["299", "紅線"]},
-                "西門站": {"routes": ["307", "紅線", "藍線"]},
-                "三重站": {"routes": ["藍線", "橘線"]},
-                "蘆洲站": {"routes": ["橘線"]},
+                # 每個站列出所有經過的方向性路線（去程+返程）
+                "台北車站": {"routes": ["307__go", "307__back", "299__go"]},
+                "板橋站":   {"routes": ["307__go", "307__back", "藍線__go", "藍線__back"]},
+                "中山站":   {"routes": ["299__go", "紅線__go"]},
+                "西門站":   {"routes": ["307__go", "307__back", "紅線__go", "藍線__go", "藍線__back"]},
+                "三重站":   {"routes": ["藍線__go", "藍線__back", "橘線__go"]},
+                "蘆洲站":   {"routes": ["橘線__go"]},
             },
             "routes": {
-                "307": ["台北車站", "西門站", "板橋站"],
-                "299": ["台北車站", "中山站"],
-                "紅線": ["中山站", "西門站"],
-                "藍線": ["西門站", "板橋站", "三重站"],
-                "橘線": ["三重站", "蘆洲站"],
+                # Go directions
+                "307__go":   ["台北車站", "西門站", "板橋站"],
+                "307__back": ["板橋站", "西門站", "台北車站"],
+                "299__go":   ["台北車站", "中山站"],
+                "紅線__go":  ["中山站", "西門站"],
+                "藍線__go":  ["西門站", "板橋站", "三重站"],
+                "藍線__back": ["三重站", "板橋站", "西門站"],
+                "橘線__go":  ["三重站", "蘆洲站"],
             },
-            "last_updated": "2026-01-01 00:00:00"
+            "last_updated": "2026-01-01 00:00:00",
+            "version": 2,
+            "direction_aware": True
         }
         
-        # 寫入暫存檔
         cls.temp_file = tempfile.NamedTemporaryFile(
             mode='w', suffix='.json', delete=False, encoding='utf-8'
         )
@@ -53,87 +75,100 @@ class TestGraphEngine(unittest.TestCase):
         os.unlink(cls.temp_file.name)
 
     def test_load_graph(self):
-        """測試圖載入"""
         self.assertTrue(self.engine.is_loaded)
         self.assertEqual(len(self.engine.stops), 6)
-        self.assertEqual(len(self.engine.routes), 5)
+        self.assertEqual(len(self.engine.routes), 7)
     
     def test_find_best_stop_match_exact(self):
-        """測試精確匹配站名"""
-        result = self.engine.find_best_stop_match("台北車站")
-        self.assertEqual(result, "台北車站")
+        self.assertEqual(self.engine.find_best_stop_match("台北車站"), "台北車站")
     
     def test_find_best_stop_match_partial(self):
-        """測試部分匹配站名"""
-        result = self.engine.find_best_stop_match("板橋")
-        self.assertEqual(result, "板橋站")
+        self.assertEqual(self.engine.find_best_stop_match("板橋"), "板橋站")
     
     def test_find_best_stop_match_not_found(self):
-        """測試找不到站名"""
-        result = self.engine.find_best_stop_match("不存在的站")
-        self.assertIsNone(result)
+        self.assertIsNone(self.engine.find_best_stop_match("不存在的站"))
     
-    def test_get_route_stop_distance(self):
-        """測試站距計算"""
-        dist = self.engine.get_route_stop_distance("307", "台北車站", "板橋站")
-        self.assertEqual(dist, 2)  # 台北車站 -> 西門站 -> 板橋站
+    # === Direction-aware distance tests ===
     
-    def test_get_route_stop_distance_not_found(self):
-        """測試站不在路線上"""
-        dist = self.engine.get_route_stop_distance("307", "台北車站", "蘆洲站")
+    def test_distance_forward(self):
+        """台北車站 -> 板橋站 via 307__go: 2 stops forward"""
+        dist = self.engine.get_route_stop_distance("307__go", "台北車站", "板橋站")
+        self.assertEqual(dist, 2)
+    
+    def test_distance_backward_rejected(self):
+        """板橋站 -> 台北車站 via 307__go should be INVALID (wrong direction!)"""
+        dist = self.engine.get_route_stop_distance("307__go", "板橋站", "台北車站")
+        self.assertEqual(dist, 999)  # Rejected: would need 307__back
+    
+    def test_distance_correct_direction_back(self):
+        """板橋站 -> 台北車站 via 307__back: 2 stops forward"""
+        dist = self.engine.get_route_stop_distance("307__back", "板橋站", "台北車站")
+        self.assertEqual(dist, 2)
+    
+    def test_distance_not_on_route(self):
+        dist = self.engine.get_route_stop_distance("307__go", "台北車站", "蘆洲站")
         self.assertEqual(dist, 999)
     
-    def test_find_candidate_paths_direct(self):
-        """測試直達路線搜尋"""
+    # === Path finding tests ===
+    
+    def test_find_direct_route(self):
+        """台北車站 -> 板橋站 should find 307__go as direct"""
         results = self.engine.find_candidate_paths("台北車站", "板橋站")
         self.assertTrue(len(results) > 0)
         self.assertEqual(results[0]["type"], "direct")
-        self.assertEqual(results[0]["segments"][0]["route"], "307")
+        self.assertEqual(results[0]["segments"][0]["route"], "307__go")
     
-    def test_find_candidate_paths_transfer(self):
-        """測試轉乘路線搜尋"""
+    def test_no_wrong_direction_direct(self):
+        """板橋站 -> 台北車站 should find 307__back, NOT 307__go"""
+        results = self.engine.find_candidate_paths("板橋站", "台北車站")
+        self.assertTrue(len(results) > 0)
+        # Should be 307__back
+        routes_found = [r["segments"][0]["route"] for r in results]
+        self.assertIn("307__back", routes_found)
+        self.assertNotIn("307__go", routes_found)
+    
+    def test_transfer_has_transfer_route(self):
+        """Transfer candidates should include transfer_route field"""
         results = self.engine.find_candidate_paths("台北車站", "蘆洲站")
         self.assertTrue(len(results) > 0)
-        # 台北車站 -> (307) -> 西門站 或 板橋站 -> (藍線) -> 三重站 -> (橘線) -> 蘆洲站
-        # 應找到某種轉乘方案
-        self.assertIn(results[0]["type"], ["transfer_greedy"])
+        for r in results:
+            if r["type"] == "transfer_greedy":
+                self.assertIn("transfer_route", r)
     
-    def test_find_candidate_paths_not_found(self):
-        """測試找不到路線"""
+    def test_find_paths_not_found(self):
         results = self.engine.find_candidate_paths("不存在", "也不存在")
         self.assertEqual(len(results), 0)
     
-    def test_get_route_stops(self):
-        """測試取得路線沿途站點"""
-        stops = self.engine.get_route_stops("307", "台北車站", "板橋站")
+    def test_get_route_stops_forward(self):
+        stops = self.engine.get_route_stops("307__go", "台北車站", "板橋站")
         self.assertEqual(stops, ["台北車站", "西門站", "板橋站"])
+    
+    def test_get_route_stops_wrong_direction(self):
+        """Wrong direction should return empty"""
+        stops = self.engine.get_route_stops("307__go", "板橋站", "台北車站")
+        self.assertEqual(stops, [])
 
 
 class TestCacheManager(unittest.TestCase):
     """CacheManager 快取測試"""
     
     def test_get_or_fetch_miss_then_hit(self):
-        """測試快取 miss 後 fetch，再次取得應為 hit"""
         from src.cache_manager import CacheManager
         
-        # 清除可能的殘留快取
-        test_key = "__test_route__"
-        
+        test_key = "__test_route_v2__"
         mock_data = {"GoDirStops": [{"Name": "Test", "ETA": 300}]}
         
         result = CacheManager.get_or_fetch(test_key, lambda x: mock_data)
         self.assertEqual(result, mock_data)
         
-        # 第二次應從快取取得 (fetch_func 不會被呼叫)
         result2 = CacheManager.get_or_fetch(test_key, lambda x: None)
         self.assertEqual(result2, mock_data)
     
     def test_set_and_get(self):
-        """測試直接 set/get"""
         from src.cache_manager import CacheManager
         
-        CacheManager.set_route_data("__test2__", {"foo": "bar"})
-        result = CacheManager.get_cached_route_data("__test2__")
+        CacheManager.set_route_data("__test2_v2__", {"foo": "bar"})
+        result = CacheManager.get_cached_route_data("__test2_v2__")
         self.assertEqual(result, {"foo": "bar"})
 
 
