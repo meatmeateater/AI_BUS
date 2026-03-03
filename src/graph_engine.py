@@ -353,7 +353,7 @@ class GraphEngine:
         end_group = self._expand_stop_group_full(end, real_end)
         
         candidates = []
-        TIME_PER_STOP = 2.5
+        TIME_PER_STOP = 2.5  # TODO: from config.settings once circular import resolved
         
         # Merge routes from all sub-stations
         start_routes = self._get_merged_routes(start_group)

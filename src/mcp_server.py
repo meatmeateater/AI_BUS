@@ -3,6 +3,7 @@ import json
 import os
 import difflib
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -150,9 +151,14 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
     if not client:
         return True, "無法驗證 (API Error)", 0
 
-    # 1. Check Frequency (High Freq)
+    # 1. Check Frequency (High Freq) — with cache
     try:
-        freqs = client.get_route_frequency(route_name)
+        cache_key = f"__freq__{route_name}"
+        freqs = CacheManager.get_cached_route_data(cache_key)
+        if freqs is None:
+            freqs = client.get_route_frequency(route_name)
+            if freqs:
+                CacheManager.set_route_data(cache_key, freqs)
         if freqs:
             f = freqs[0] 
             min_h = f.get("MinHeadwayMins", 999)
@@ -163,7 +169,12 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
 
     # 2. Check Schedule (Fixed Time)
     try:
-        scheds = client.get_schedule(route_name)
+        sched_key = f"__sched__{route_name}"
+        scheds = CacheManager.get_cached_route_data(sched_key)
+        if scheds is None:
+            scheds = client.get_schedule(route_name)
+            if scheds:
+                CacheManager.set_route_data(sched_key, scheds)
         if not scheds:
              return False, "無班表資料", 30
 
@@ -217,14 +228,41 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     ranked_results = []
     current_time = datetime.now()
     
+    # P0-1: Pre-fetch all unique routes in parallel
+    routes_to_fetch = set()
     for cand in candidates:
         seg1 = cand["segments"][0]
-        route_key = seg1["route"]           # e.g. "307__go"
-        base_route = get_base_route_name(route_key)  # e.g. "307"
-        stop_from = seg1["from"]
-        stop_from_uid = seg1.get("from_uid")  # P1: StopUID for precise matching
+        base_route = get_base_route_name(seg1["route"])
+        real_name = find_canonical_route_name(base_route)
+        if not real_name and not routes_map:
+            real_name = base_route
+        if real_name:
+            routes_to_fetch.add(real_name)
+    
+    # Parallel API fetch (only uncached routes)
+    uncached = [r for r in routes_to_fetch if not CacheManager.get_cached_route_data(r)]
+    if uncached:
+        def _fetch(route_id):
+            return route_id, BusCrawler.get_route_data(route_id)
         
-        # 1. Fetch Real-time ETA for First Leg
+        with ThreadPoolExecutor(max_workers=min(len(uncached), 5)) as pool:
+            futures = {pool.submit(_fetch, r): r for r in uncached}
+            for future in as_completed(futures):
+                try:
+                    rid, data = future.result()
+                    if data:
+                        CacheManager.set_route_data(rid, data)
+                except Exception as e:
+                    logger.warning(f"Parallel fetch failed: {e}")
+    
+    # Now score each candidate (all data is cached)
+    for cand in candidates:
+        seg1 = cand["segments"][0]
+        route_key = seg1["route"]
+        base_route = get_base_route_name(route_key)
+        stop_from = seg1["from"]
+        stop_from_uid = seg1.get("from_uid")
+        
         real_route_name = find_canonical_route_name(base_route)
         if not real_route_name:
             if not routes_map:
@@ -232,7 +270,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
             else:
                 continue
             
-        data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
+        data = CacheManager.get_cached_route_data(real_route_name)
         
         wait_time = 999 
         wait_text = "無資料"
@@ -240,7 +278,6 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         if data:
             valid_etas = []
             
-            # Match ETA based on direction from route key
             if route_key.endswith(DIR_GO):
                 dir_stops = data.get("GoDirStops", [])
             elif route_key.endswith(DIR_BACK):
@@ -249,7 +286,6 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
                 dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
             
             for s in dir_stops:
-                # P1: Prefer StopUID matching (exact), fallback to name matching
                 matched = False
                 if stop_from_uid and s.get("StopUID"):
                     matched = s["StopUID"] == stop_from_uid
