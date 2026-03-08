@@ -8,8 +8,6 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 # Ensure project root is in sys.path for module resolution
-# Preferred: run with `python -m src.mcp_server` from project root
-# This fallback handles direct `python src/mcp_server.py` invocations
 import sys
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
@@ -17,7 +15,13 @@ if _project_root not in sys.path:
 
 from src.crawler_core import BusCrawler
 from src.cache_manager import CacheManager
-from src.graph_engine import GraphEngine
+from src.graph_engine import (
+    GraphEngine, get_base_route_name, get_direction_label
+)
+from config.settings import (
+    DIR_GO, DIR_BACK, SAFE_TRANSFER_HEADWAY_MINS,
+    DEFAULT_NO_BUS_WAIT, MAX_PARALLEL_WORKERS, TOP_K_RESULTS
+)
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -41,6 +45,7 @@ else:
 # Initialize Graph Engine
 graph_engine = GraphEngine(GRAPH_FILE)
 
+
 def find_canonical_route_name(route_name: str) -> Optional[str]:
     """
     Fuzzy search for route Name.
@@ -56,6 +61,25 @@ def find_canonical_route_name(route_name: str) -> Optional[str]:
     
     return None
 
+
+def _normalize_stop_for_eta(stop_name: str, dir_stops: list) -> list:
+    """
+    用 GraphEngine 的正規化邏輯匹配 ETA 站名。
+    回傳所有匹配的 stop dicts。
+    """
+    from src.graph_engine import GraphEngine
+    variants = GraphEngine._normalize_stop_name(stop_name)
+    
+    matched = []
+    for s in dir_stops:
+        s_name = s.get("Name", "")
+        for v in variants:
+            if v in s_name:
+                matched.append(s)
+                break
+    return matched
+
+
 @mcp.tool()
 def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go") -> str:
     """
@@ -69,42 +93,41 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
     Returns:
         String describing the arrival time or status.
     """
-    # 1. Find Canonical Route Name
-    real_route_name = find_canonical_route_name(route_name)
-    if not real_route_name:
-        # Fallback: if map is empty (might happen if not initialized), try using the input name
-        # TDX usually handles "307" fine. 
-        if not routes_map:
-            real_route_name = route_name
+    try:
+        # 1. Find Canonical Route Name
+        real_route_name = find_canonical_route_name(route_name)
+        if not real_route_name:
+            if not routes_map:
+                real_route_name = route_name
+            else:
+                 return f"找不到路線：{route_name}"
+
+        # 2. Fetch Data (Cached)
+        data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
+        if not data:
+            return f"無法取得 {real_route_name} 的即時資料，請稍後再試。"
+
+        # 3. Parse and Find Stop(s)
+        found_stops = []
+        
+        directions_to_search = []
+        if direction.lower() in ["go", "去程"]:
+            directions_to_search.append(("去程", data.get("GoDirStops", [])))
+        elif direction.lower() in ["back", "return", "返程"]:
+            directions_to_search.append(("返程", data.get("BackDirStops", [])))
         else:
-             return f"找不到路線：{route_name}"
+            directions_to_search.append(("去程", data.get("GoDirStops", [])))
+            directions_to_search.append(("返程", data.get("BackDirStops", [])))
 
-    # 2. Fetch Data (Cached)
-    data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
-    if not data:
-        return f"無法取得 {real_route_name} 的即時資料，請稍後再試。"
-
-    # 3. Parse and Find Stop(s)
-    found_stops = []
-    
-    directions_to_search = []
-    if direction.lower() in ["go", "去程"]:
-        directions_to_search.append(("去程", data.get("GoDirStops", [])))
-    elif direction.lower() in ["back", "return", "返程"]:
-        directions_to_search.append(("返程", data.get("BackDirStops", [])))
-    else:
-        # Search both
-        directions_to_search.append(("去程", data.get("GoDirStops", [])))
-        directions_to_search.append(("返程", data.get("BackDirStops", [])))
-
-    for dir_name, stops in directions_to_search:
-        if not stops:
-            continue
+        for dir_name, stops in directions_to_search:
+            if not stops:
+                continue
             
-        # Filter by stop name (Partial match)
-        for stop in stops:
-            s_name = stop.get("Name", "")
-            if stop_name in s_name:
+            # P1-1.2: 使用 normalize 匹配（台↔臺, 捷運前綴等）
+            matched_stops = _normalize_stop_for_eta(stop_name, stops)
+            
+            for stop in matched_stops:
+                s_name = stop.get("Name", "")
                 eta = stop.get("ETA")
                 next_dep = stop.get("NextDepTime")
                 
@@ -113,11 +136,6 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
                      status_text = f"預計 {next_dep} 發車"
                 elif eta is not None:
                      eta_val = int(eta)
-                     # TDX StopStatus 已在 crawler_core 轉換：
-                     # 65535 / 65529 = 尚未發車 (正數)
-                     # -2 = 已過站
-                     # -3 = 末班車已過
-                     # >= 0 正常值 (秒數)
                      if eta_val == 65535 or eta_val == 65529:
                          status_text = "尚未發車"
                      elif eta_val == -2:
@@ -136,10 +154,14 @@ def get_bus_arrival_time(route_name: str, stop_name: str, direction: str = "go")
                 
                 found_stops.append(f"往 {dir_name}：{s_name} - {status_text}")
 
-    if not found_stops:
-        return f"路線 {route_name} ({real_route_name}) 上找不到站牌「{stop_name}」。"
+        if not found_stops:
+            return f"路線 {route_name} ({real_route_name}) 上找不到站牌「{stop_name}」。"
 
-    return f"【{real_route_name}】目前狀態：\n" + "\n".join(found_stops)
+        return f"【{real_route_name}】目前狀態：\n" + "\n".join(found_stops)
+    
+    except Exception as e:
+        logger.error(f"get_bus_arrival_time error: {e}", exc_info=True)
+        return f"查詢失敗：{e}"
 
 
 def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple:
@@ -162,7 +184,7 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
         if freqs:
             f = freqs[0] 
             min_h = f.get("MinHeadwayMins", 999)
-            if min_h <= 20:
+            if min_h <= SAFE_TRANSFER_HEADWAY_MINS:
                 return True, f"班次密集 (約 {min_h}分一班)", min_h / 2
     except Exception as e:
         logger.warning(f"Freq check fail: {e}")
@@ -215,11 +237,8 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
 def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     """
     Core logic to find best route with real-time data.
-    Route keys from graph_engine are direction-aware (e.g. '307__go').
-    We strip the suffix when calling TDX API.
+    Returns top results (ranked by total_time).
     """
-    from src.graph_engine import get_base_route_name, DIR_GO, DIR_BACK
-    
     candidates = graph_engine.find_candidate_paths(start, end, top_k=5)
     
     if not candidates:
@@ -228,7 +247,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     ranked_results = []
     current_time = datetime.now()
     
-    # P0-1: Pre-fetch all unique routes in parallel
+    # Pre-fetch all unique routes in parallel
     routes_to_fetch = set()
     for cand in candidates:
         seg1 = cand["segments"][0]
@@ -245,7 +264,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         def _fetch(route_id):
             return route_id, BusCrawler.get_route_data(route_id)
         
-        with ThreadPoolExecutor(max_workers=min(len(uncached), 5)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(uncached), MAX_PARALLEL_WORKERS)) as pool:
             futures = {pool.submit(_fetch, r): r for r in uncached}
             for future in as_completed(futures):
                 try:
@@ -255,7 +274,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
                 except Exception as e:
                     logger.warning(f"Parallel fetch failed: {e}")
     
-    # Now score each candidate (all data is cached)
+    # Score each candidate (all data is cached)
     for cand in candidates:
         seg1 = cand["segments"][0]
         route_key = seg1["route"]
@@ -303,13 +322,13 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
                 wait_text = f"{int(wait_time)} 分鐘"
             else:
                 wait_text = "目前無車"
-                wait_time = 60
+                wait_time = DEFAULT_NO_BUS_WAIT
 
-        # Total Score = wait + leg1 travel + estimated remaining (for fair comparison)
+        # Total Score = wait + leg1 travel + estimated remaining
         remaining = cand.get("remaining_time", 0)
         total_time = cand["static_time"] + wait_time + remaining
         
-        # Check transfer safety — use the TRANSFER route (leg 2), not leg 1
+        # Check transfer safety
         safety_note = ""
         if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
             transfer_route_key = cand["transfer_route"]
@@ -323,15 +342,16 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
         cand["total_time"] = total_time
         cand["wait_text"] = wait_text
         cand["safety_note"] = safety_note
-        cand["display_route"] = base_route  # Clean name for UI
+        cand["display_route"] = base_route
         ranked_results.append(cand)
 
     ranked_results.sort(key=lambda x: x["total_time"])
     
     if not ranked_results:
         return {"error": "No reachable route with data"}
-        
-    return ranked_results[0]
+    
+    # P1-1.1: 回傳 top-N 而非只有第一名
+    return {"results": ranked_results[:TOP_K_RESULTS]}
 
 
 @mcp.tool()
@@ -339,45 +359,55 @@ def plan_trip(start: str, end: str) -> str:
     """
     規劃公車路線 (A站 到 B站)，依據「最快時間」推薦。
     若需轉乘，會採用「分段導航」模式，優先引導您搭上最快到達中繼站的車。
+    顯示最多 3 個方案供選擇。
     
     Args:
        start: 起點站牌名稱
        end: 終點站牌名稱
     """
-    from src.graph_engine import get_base_route_name, get_direction_label
-    
-    best = calculate_best_route(start, end)
-    
-    if "error" in best:
-        return f"找不到從「{start}」到「{end}」的建議路線。({best['error']})"
+    try:
+        result = calculate_best_route(start, end)
+        
+        if "error" in result:
+            return f"找不到從「{start}」到「{end}」的建議路線。({result['error']})"
+        
+        ranked = result["results"]
+        parts = [f"🔍 找到 {len(ranked)} 個方案 (從「{start}」到「{end}」)\n"]
+        
+        for i, best in enumerate(ranked, 1):
+            est = int(best['total_time'])
+            parts.append(f"{'━' * 40}")
+            parts.append(f"📌 方案 {i} — 預估 {est} 分鐘")
             
-    response = f"🚀 最快路線建議 (預估總時程: {int(best['total_time'])} 分鐘)\n"
+            if best["type"] == "direct":
+                seg = best["segments"][0]
+                route_display = get_base_route_name(seg['route'])
+                direction = get_direction_label(seg['route'])
+                dir_info = f" {direction}" if direction else ""
+                parts.append(f"  👉 搭乘【{route_display}】{dir_info} (直達)")
+                parts.append(f"     從 [{seg['from']}] 上車 (等候: {best['wait_text']})")
+                parts.append(f"     抵達 [{seg['to']}] ({best['stop_count']} 站)")
+                
+            elif best["type"] == "transfer_greedy":
+                s1 = best["segments"][0]
+                route_display = get_base_route_name(s1['route'])
+                direction = get_direction_label(s1['route'])
+                dir_info = f" {direction}" if direction else ""
+                mid = best["transfer_stop"]
+                safety = best.get("safety_note", "")
+                parts.append(f"  👉 需轉乘 {safety}")
+                parts.append(f"  1. 搭【{route_display}】{dir_info} 從 [{s1['from']}] 上車 (等候: {best['wait_text']})")
+                parts.append(f"     坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)")
+                parts.append(f"  2. 抵達 [{mid}] 後，請再問我『{mid} 到 {end}』以獲取最新動態")
+            
+            parts.append("")
+        
+        return "\n".join(parts)
     
-    if best["type"] == "direct":
-        seg = best["segments"][0]
-        route_display = get_base_route_name(seg['route'])
-        direction = get_direction_label(seg['route'])
-        dir_info = f" {direction}" if direction else ""
-        response += f"\n👉 請搭乘【{route_display}】{dir_info} (直達)\n"
-        response += f"   從 [{seg['from']}] 上車 (等候: {best['wait_text']})\n"
-        response += f"   抵達 [{seg['to']}] \n"
-        
-    elif best["type"] == "transfer_greedy":
-        s1 = best["segments"][0]
-        route_display = get_base_route_name(s1['route'])
-        direction = get_direction_label(s1['route'])
-        dir_info = f" {direction}" if direction else ""
-        mid = best["transfer_stop"]
-        safety = best.get("safety_note", "")
-        response += f"\n👉 需轉乘 (分段導航) {safety}\n"
-        response += f"1. 先搭乘【{route_display}】{dir_info} 從 [{s1['from']}] 上車 (等候: {best['wait_text']})\n"
-        response += f"   坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)\n"
-        response += f"\n⚠️ **重要**：這是最快能帶您離開起點並接近終點的路線。\n"
-        response += f"   抵達 [{mid}] 後，請再次詢問我『{mid} 到 {end} 怎麼轉車』以獲取最新動態。\n"
-        
-    return response
+    except Exception as e:
+        logger.error(f"plan_trip error: {e}", exc_info=True)
+        return f"規劃路線時發生錯誤：{e}"
 
 
 if __name__ == "__main__":
     mcp.run()
-

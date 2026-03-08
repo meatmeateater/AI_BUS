@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 import logging
 from typing import Dict, Any, List, Optional
@@ -22,11 +23,15 @@ class TDXClient:
             
         self.access_token = None
         self.token_expiry = 0
+        self._auth_lock = threading.Lock()
 
     def _get_auth_header(self) -> Dict[str, str]:
-        """Get the Authorization header with a valid access token."""
+        """Get the Authorization header with a valid access token (thread-safe)."""
         if self.access_token is None or time.time() >= self.token_expiry:
-            self._authenticate()
+            with self._auth_lock:
+                # Double-check after acquiring lock
+                if self.access_token is None or time.time() >= self.token_expiry:
+                    self._authenticate()
         return {
             "authorization": f"Bearer {self.access_token}",
             "Accept-Encoding": "gzip" # Recommended by TDX

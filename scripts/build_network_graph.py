@@ -10,6 +10,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
 from src.crawler_core import BusCrawler
+from config.settings import DIR_GO, DIR_BACK
 
 # Config
 ROUTES_MAP_FILE = os.path.join(BASE_DIR, 'data', 'static', 'routes_map.json')
@@ -28,8 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DIR_GO = "__go"
-DIR_BACK = "__back"
+
 
 
 def build_graph():

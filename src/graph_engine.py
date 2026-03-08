@@ -5,11 +5,12 @@ import logging
 from typing import List, Dict, Optional, Tuple, Any
 from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+from config.settings import (
+    DIR_GO, DIR_BACK, TIME_PER_STOP,
+    INVALID_DISTANCE, MAX_VALID_DISTANCE
+)
 
-# Direction suffix constants
-DIR_GO = "__go"
-DIR_BACK = "__back"
+logger = logging.getLogger(__name__)
 
 
 def get_base_route_name(route_key: str) -> str:
@@ -221,21 +222,21 @@ class GraphEngine:
         """
         Calculate directed distance using pre-computed index. O(K²) where K = occurrences.
         Only counts FORWARD direction (end index > start index).
-        Returns 999 if not found or wrong direction.
+        Returns INVALID_DISTANCE if not found or wrong direction.
         """
         if not self.is_loaded:
             self.load_graph()
         if route_name not in self._stop_index:
-            return 999
+            return INVALID_DISTANCE
             
         idx = self._stop_index[route_name]
         start_indices = idx.get(start)
         end_indices = idx.get(end)
         
         if not start_indices or not end_indices:
-            return 999
+            return INVALID_DISTANCE
             
-        min_dist = 999
+        min_dist = INVALID_DISTANCE
         for s_idx in start_indices:
             for e_idx in end_indices:
                 dist = e_idx - s_idx
@@ -259,7 +260,7 @@ class GraphEngine:
         if not start_indices or not end_indices:
             return []
         
-        min_dist = 999
+        min_dist = INVALID_DISTANCE
         best_s = -1
         best_e = -1
         
@@ -353,7 +354,6 @@ class GraphEngine:
         end_group = self._expand_stop_group_full(end, real_end)
         
         candidates = []
-        TIME_PER_STOP = 2.5  # TODO: from config.settings once circular import resolved
         
         # Merge routes from all sub-stations
         start_routes = self._get_merged_routes(start_group)
@@ -364,7 +364,7 @@ class GraphEngine:
         
         for r in common_routes:
             # Try all start_sub × end_sub combinations to find valid pairs
-            best_dist = 999
+            best_dist = INVALID_DISTANCE
             best_from = None
             best_to = None
             for s in start_group:
@@ -375,7 +375,7 @@ class GraphEngine:
                         best_from = s
                         best_to = e
             
-            if best_dist < 900 and best_from and best_to:
+            if best_dist < MAX_VALID_DISTANCE and best_from and best_to:
                 est_time = best_dist * TIME_PER_STOP
                 start_uid = self.get_stop_uid(r, best_from)
                 candidates.append({
@@ -411,7 +411,7 @@ class GraphEngine:
             
             best_r1 = None
             best_from = None
-            min_d1 = 999
+            min_d1 = INVALID_DISTANCE
             
             for r in r1_candidates:
                 # Find best sub-station from start_group for this route
@@ -422,14 +422,14 @@ class GraphEngine:
                         best_r1 = r
                         best_from = sg
             
-            if min_d1 >= 900 or not best_r1:
+            if min_d1 >= MAX_VALID_DISTANCE or not best_r1:
                 continue
             
             # Find Best Leg 2 (Mid -> End)
             r2_candidates = [r for r in end_routes if mid in self._stop_index.get(r, {})]
             
             best_r2 = None
-            min_d2 = 999
+            min_d2 = INVALID_DISTANCE
             
             for r in r2_candidates:
                 for eg in end_group:
@@ -442,7 +442,7 @@ class GraphEngine:
                 continue
                 
             est_time_leg1 = min_d1 * TIME_PER_STOP
-            est_time_leg2 = min_d2 * TIME_PER_STOP if min_d2 < 900 else 0
+            est_time_leg2 = min_d2 * TIME_PER_STOP if min_d2 < MAX_VALID_DISTANCE else 0
             
             start_uid = self.get_stop_uid(best_r1, best_from)
             candidates.append({
@@ -490,7 +490,7 @@ class GraphEngine:
                      for r in valid_r1s:
                          for sg in start_group:
                              d = self.get_route_stop_distance(r, sg, m1)
-                             if d < 900:
+                             if d < MAX_VALID_DISTANCE:
                                  t = d * TIME_PER_STOP
                                  if t < min_time_to_m1:
                                      min_time_to_m1 = t
