@@ -26,7 +26,8 @@ from collections import defaultdict
 
 from config.settings import (
     DIR_GO, DIR_BACK, TIME_PER_STOP,
-    INVALID_DISTANCE, MAX_VALID_DISTANCE, DIRECT_SKIP_THRESHOLD
+    INVALID_DISTANCE, MAX_VALID_DISTANCE, DIRECT_SKIP_THRESHOLD,
+    WALK_SPEED_M_PER_MIN, MAX_WALK_RADIUS_M
 )
 
 logger = logging.getLogger(__name__)
@@ -631,3 +632,103 @@ class GraphEngine:
         # 按靜態時間排序，回傳前 K 個
         candidates.sort(key=lambda x: x["static_time"])
         return candidates[:top_k]
+
+    # ====================================================================
+    #  目的地半徑搜尋
+    # ====================================================================
+
+    def find_nearby_stops(
+        self,
+        lat: float,
+        lon: float,
+        radius_m: float = MAX_WALK_RADIUS_M
+    ) -> List[Dict]:
+        """
+        找出 GPS 座標半徑內的所有公車站。
+
+        使用場景：
+            使用者想去「台北 101」，AI 提供座標 (25.0339, 121.5645)，
+            本方法找出 400m 內所有站牌作為候選終點。
+
+        Args:
+            lat, lon: 目標 GPS 座標
+            radius_m: 搜尋半徑 (預設 400m ≈ 步行 5 分鐘)
+
+        Returns:
+            按距離排序的站點列表：
+            [{"name": "站名", "distance_m": 150, "walk_min": 1.9}, ...]
+        """
+        if not self.is_loaded:
+            self.load_graph()
+
+        results = []
+        for stop_name, stop_data in self.stops.items():
+            s_lat = stop_data.get("lat")
+            s_lon = stop_data.get("lon")
+            if s_lat is None or s_lon is None:
+                continue
+            dist = haversine_distance(lat, lon, s_lat, s_lon)
+            if dist <= radius_m:
+                results.append({
+                    "name": stop_name,
+                    "distance_m": round(dist),
+                    "walk_min": round(dist / WALK_SPEED_M_PER_MIN, 1),
+                    "lat": s_lat,
+                    "lon": s_lon
+                })
+
+        results.sort(key=lambda x: x["distance_m"])
+        return results
+
+    def find_best_route_to_area(
+        self,
+        start: str,
+        nearby_stops: List[Dict],
+        top_k: int = 5
+    ) -> List[Dict]:
+        """
+        對多個終點站配對搜尋，綜合公車時間 + 步行時間排名。
+
+        流程：
+            1. 對每個 nearby_stop 執行 find_candidate_paths(start, stop_name)
+            2. 將步行時間附加到每個候選
+            3. 以 static_time + walk_min 排序，回傳 top_k
+
+        Args:
+            start: 起點站名
+            nearby_stops: find_nearby_stops() 的回傳結果
+            top_k: 回傳前 K 個候選
+
+        Returns:
+            候選路徑列表，每個多了 walk_min / walk_distance_m / dest_stop 欄位
+        """
+        all_candidates = []
+
+        for stop_info in nearby_stops:
+            dest_name = stop_info["name"]
+            walk_min = stop_info["walk_min"]
+            walk_m = stop_info["distance_m"]
+
+            candidates = self.find_candidate_paths(start, dest_name, top_k=3)
+
+            for cand in candidates:
+                # 附加步行資訊
+                cand["walk_min"] = walk_min
+                cand["walk_distance_m"] = walk_m
+                cand["dest_stop"] = dest_name
+                # 調整排序分數：公車行駛 + 步行
+                cand["area_score"] = cand["static_time"] + walk_min
+                all_candidates.append(cand)
+
+        # 去重：同一路線到不同子站只保留最佳
+        seen_routes = {}
+        for cand in all_candidates:
+            seg_route = cand["segments"][0]["route"]
+            dest = cand["dest_stop"]
+            key = f"{seg_route}_{cand['type']}_{dest}"
+            if key not in seen_routes or cand["area_score"] < seen_routes[key]["area_score"]:
+                seen_routes[key] = cand
+
+        unique = list(seen_routes.values())
+        unique.sort(key=lambda x: x["area_score"])
+        return unique[:top_k]

@@ -36,6 +36,7 @@ sys.modules.setdefault('mcp.server.fastmcp', _mock_fastmcp)
 from src.mcp_server import (
     _normalize_stop_for_eta, find_canonical_route_name,
     calculate_best_route, plan_trip, check_transfer_safety,
+    plan_trip_to_location, calculate_best_route_to_area,
     routes_map
 )
 
@@ -205,6 +206,48 @@ class TestCheckTransferSafety(unittest.TestCase):
             is_safe, reason, wait = check_transfer_safety("307", datetime.now())
             self.assertTrue(is_safe)
             self.assertIn("無法驗證", reason)
+
+
+class TestPlanTripToLocation(unittest.TestCase):
+    """測試 plan_trip_to_location GPS 半徑搜尋。"""
+
+    def test_error_no_nearby(self):
+        """附近沒站牌時回傳錯誤。"""
+        with patch('src.mcp_server.graph_engine') as mock_ge:
+            mock_ge.find_nearby_stops.return_value = []
+            result = plan_trip_to_location("大安森林公園", "海上", 25.0, 122.5)
+            self.assertIn("找不到", result)
+
+    def test_output_contains_walking(self):
+        """輸出應包含步行距離和目的地名稱。"""
+        mock_result = {
+            "results": [{
+                "type": "direct",
+                "segments": [{"route": "680__go", "from": "大安森林公園", "to": "信義光復路口"}],
+                "total_time": 12,
+                "wait_text": "3 分鐘",
+                "stop_count": 4,
+                "safety_note": "",
+                "display_route": "680",
+                "static_time": 10.0,
+                "walk_min": 2.0,
+                "walk_distance_m": 150,
+                "dest_stop": "信義光復路口",
+            }],
+            "nearby_count": 5
+        }
+        with patch('src.mcp_server.calculate_best_route_to_area', return_value=mock_result):
+            result = plan_trip_to_location("大安森林公園", "台北101", 25.0339, 121.5645)
+            self.assertIn("台北101", result)
+            self.assertIn("步行", result)
+            self.assertIn("150m", result)
+            self.assertIn("方案 1", result)
+
+    def test_exception_handling(self):
+        """應 catch exceptions。"""
+        with patch('src.mcp_server.calculate_best_route_to_area', side_effect=RuntimeError("boom")):
+            result = plan_trip_to_location("A", "B", 25.0, 121.0)
+            self.assertIn("錯誤", result)
 
 
 if __name__ == "__main__":

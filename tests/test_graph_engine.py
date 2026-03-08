@@ -207,5 +207,78 @@ class TestCacheManager(unittest.TestCase):
         self.assertEqual(CacheManager.get_cached_route_data("__test2_v3__"), {"foo": "bar"})
 
 
+class TestFindNearbyStops(unittest.TestCase):
+    """測試 GPS 半徑站牌搜尋（使用真實圖檔）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        graph_file = os.path.join(
+            os.path.dirname(__file__), '..', 'data', 'static', 'bus_graph.json'
+        )
+        if not os.path.exists(graph_file):
+            raise unittest.SkipTest("bus_graph.json not found")
+        cls.engine = GraphEngine(graph_file)
+
+    def test_taipei101_area(self):
+        """台北101 附近 (25.0339, 121.5645) 應能找到多個站牌。"""
+        stops = self.engine.find_nearby_stops(25.0339, 121.5645, radius_m=400)
+        self.assertTrue(len(stops) > 0)
+        for s in stops:
+            self.assertIn("name", s)
+            self.assertIn("distance_m", s)
+            self.assertIn("walk_min", s)
+        distances = [s["distance_m"] for s in stops]
+        self.assertEqual(distances, sorted(distances))
+
+    def test_no_stops_in_ocean(self):
+        """海上座標不應有站牌。"""
+        stops = self.engine.find_nearby_stops(25.0, 122.5, radius_m=400)
+        self.assertEqual(len(stops), 0)
+
+    def test_larger_radius(self):
+        """增大半徑應找到更多站牌。"""
+        small = self.engine.find_nearby_stops(25.0339, 121.5645, radius_m=200)
+        large = self.engine.find_nearby_stops(25.0339, 121.5645, radius_m=800)
+        self.assertTrue(len(large) >= len(small))
+
+
+class TestFindBestRouteToArea(unittest.TestCase):
+    """測試多終點配對搜尋（使用真實圖檔）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        graph_file = os.path.join(
+            os.path.dirname(__file__), '..', 'data', 'static', 'bus_graph.json'
+        )
+        if not os.path.exists(graph_file):
+            raise unittest.SkipTest("bus_graph.json not found")
+        cls.engine = GraphEngine(graph_file)
+
+    def test_returns_candidates_with_walk_info(self):
+        """回傳的候選應包含 walk_min 和 dest_stop。"""
+        nearby = self.engine.find_nearby_stops(25.0339, 121.5645, radius_m=400)
+        if not nearby:
+            self.skipTest("No nearby stops found")
+
+        results = self.engine.find_best_route_to_area("大安森林公園", nearby, top_k=3)
+        self.assertTrue(len(results) > 0)
+
+        for r in results:
+            self.assertIn("walk_min", r)
+            self.assertIn("dest_stop", r)
+            self.assertIn("area_score", r)
+
+    def test_sorted_by_area_score(self):
+        """結果應按 area_score 排序。"""
+        nearby = self.engine.find_nearby_stops(25.0339, 121.5645, radius_m=400)
+        if not nearby:
+            self.skipTest("No nearby stops found")
+
+        results = self.engine.find_best_route_to_area("大安森林公園", nearby, top_k=5)
+        if len(results) > 1:
+            scores = [r["area_score"] for r in results]
+            self.assertEqual(scores, sorted(scores))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -491,6 +491,219 @@ def plan_trip(start: str, end: str) -> str:
 
 
 # ====================================================================
+#  MCP Tool: 到地點的路線規劃 (GPS 半徑搜尋)
+# ====================================================================
+
+def calculate_best_route_to_area(
+    start: str, dest_lat: float, dest_lon: float
+) -> Dict[str, Any]:
+    """
+    結合離線圖搜尋 + 即時 API + 步行距離，計算到某地點附近的最佳路線。
+
+    流程:
+        1. find_nearby_stops → 400m 半徑內所有站牌
+        2. find_best_route_to_area → 多終點配對 (離線)
+        3. 並行 fetch 即時 ETA
+        4. total_time = 等車 + 搭車 + 步行
+        5. 排序後回傳 top-N
+    """
+    # ── 步驟 1: 找附近站牌 ──
+    nearby = graph_engine.find_nearby_stops(dest_lat, dest_lon)
+    if not nearby:
+        return {"error": "附近 400m 內找不到任何公車站牌"}
+
+    # ── 步驟 2: 多終點配對搜尋 (離線) ──
+    candidates = graph_engine.find_best_route_to_area(start, nearby, top_k=5)
+    if not candidates:
+        return {"error": "No candidates"}
+
+    ranked_results = []
+    current_time = datetime.now()
+
+    # ── 步驟 3: 並行 fetch 即時 ETA ──
+    routes_to_fetch = set()
+    for cand in candidates:
+        seg1 = cand["segments"][0]
+        base_route = get_base_route_name(seg1["route"])
+        real_name = find_canonical_route_name(base_route)
+        if not real_name and not routes_map:
+            real_name = base_route
+        if real_name:
+            routes_to_fetch.add(real_name)
+
+    uncached = [r for r in routes_to_fetch if not CacheManager.get_cached_route_data(r)]
+    if uncached:
+        def _fetch(route_id):
+            return route_id, BusCrawler.get_route_data(route_id)
+
+        with ThreadPoolExecutor(max_workers=min(len(uncached), MAX_PARALLEL_WORKERS)) as pool:
+            futures = {pool.submit(_fetch, r): r for r in uncached}
+            for future in as_completed(futures):
+                try:
+                    rid, data = future.result()
+                    if data:
+                        CacheManager.set_route_data(rid, data)
+                except Exception as e:
+                    logger.warning(f"Parallel fetch failed: {e}")
+
+    # ── 步驟 4: 對每個候選計算即時分數 ──
+    for cand in candidates:
+        seg1 = cand["segments"][0]
+        route_key = seg1["route"]
+        base_route = get_base_route_name(route_key)
+        stop_from = seg1["from"]
+        stop_from_uid = seg1.get("from_uid")
+
+        real_route_name = find_canonical_route_name(base_route)
+        if not real_route_name:
+            if not routes_map:
+                real_route_name = base_route
+            else:
+                continue
+
+        data = CacheManager.get_cached_route_data(real_route_name)
+
+        wait_time = INVALID_DISTANCE
+        wait_text = "無資料"
+
+        if data:
+            valid_etas = []
+            if route_key.endswith(DIR_GO):
+                dir_stops = data.get("GoDirStops", [])
+            elif route_key.endswith(DIR_BACK):
+                dir_stops = data.get("BackDirStops", [])
+            else:
+                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
+
+            for s in dir_stops:
+                matched = False
+                if stop_from_uid and s.get("StopUID"):
+                    matched = s["StopUID"] == stop_from_uid
+                else:
+                    matched = stop_from in s.get("Name", "")
+
+                if matched:
+                    e = s.get("ETA")
+                    if e is not None and int(e) >= 0:
+                        valid_etas.append(int(e))
+
+            if valid_etas:
+                wait_time_sec = min(valid_etas)
+                wait_time = wait_time_sec / 60.0
+                wait_text = f"{int(wait_time)} 分鐘"
+            else:
+                wait_text = "目前無車"
+                wait_time = DEFAULT_NO_BUS_WAIT
+
+        # total = 等車 + 搭車 + 剩餘 + 步行
+        remaining = cand.get("remaining_time", 0)
+        walk_min = cand.get("walk_min", 0)
+        total_time = cand["static_time"] + wait_time + remaining + walk_min
+
+        # 轉乘安全檢查
+        safety_note = ""
+        if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
+            transfer_route_key = cand["transfer_route"]
+            transfer_base = get_base_route_name(transfer_route_key)
+            estimated_arrival_at_mid = current_time + timedelta(
+                minutes=cand["static_time"] + wait_time
+            )
+            is_safe, reason, extra_wait = check_transfer_safety(
+                transfer_base, estimated_arrival_at_mid
+            )
+            safety_note = f"({reason})"
+            if not is_safe:
+                total_time += extra_wait
+
+        cand["total_time"] = total_time
+        cand["wait_text"] = wait_text
+        cand["safety_note"] = safety_note
+        cand["display_route"] = base_route
+        ranked_results.append(cand)
+
+    # ── 步驟 5: 排序，取 top-N ──
+    ranked_results.sort(key=lambda x: x["total_time"])
+
+    if not ranked_results:
+        return {"error": "No reachable route with data"}
+
+    return {
+        "results": ranked_results[:TOP_K_RESULTS],
+        "nearby_count": len(nearby)
+    }
+
+
+@mcp.tool()
+def plan_trip_to_location(
+    start: str,
+    destination: str,
+    dest_lat: float,
+    dest_lon: float
+) -> str:
+    """
+    規劃公車路線到任意地點（使用 GPS 座標）。
+    系統會自動搜尋目的地步行 5 分鐘內的所有公車站，找出最佳路線。
+
+    Args:
+        start: 起點站牌名稱 (如 "大安森林公園")
+        destination: 目的地名稱 (如 "台北101"，僅用於顯示)
+        dest_lat: 目的地緯度 (如 25.0339)
+        dest_lon: 目的地經度 (如 121.5645)
+    """
+    try:
+        result = calculate_best_route_to_area(start, dest_lat, dest_lon)
+
+        if "error" in result:
+            return f"找不到從「{start}」到「{destination}」附近的路線。({result['error']})"
+
+        ranked = result["results"]
+        nearby_count = result["nearby_count"]
+        parts = [
+            f"🔍 「{destination}」附近找到 {nearby_count} 個公車站",
+            f"   篩選出 {len(ranked)} 個最佳方案 (從「{start}」出發)\n"
+        ]
+
+        for i, best in enumerate(ranked, 1):
+            est = int(best['total_time'])
+            walk_m = best.get('walk_distance_m', 0)
+            walk_t = best.get('walk_min', 0)
+            dest_stop_name = best.get('dest_stop', best['segments'][0].get('to', '?'))
+            parts.append(f"{'━' * 40}")
+            parts.append(f"📌 方案 {i} — 預估 {est} 分鐘 (含步行 {walk_t} 分鐘)")
+
+            if best["type"] == "direct":
+                seg = best["segments"][0]
+                route_display = get_base_route_name(seg['route'])
+                direction = get_direction_label(seg['route'])
+                dir_info = f" {direction}" if direction else ""
+                parts.append(f"  👉 搭乘【{route_display}】{dir_info} (直達)")
+                parts.append(f"     從 [{seg['from']}] 上車 (等候: {best['wait_text']})")
+                parts.append(f"     抵達 [{dest_stop_name}] ({best['stop_count']} 站)")
+                parts.append(f"  🚶 下車後步行 {walk_m}m (約 {walk_t} 分鐘) 到 {destination}")
+
+            elif best["type"] == "transfer_greedy":
+                s1 = best["segments"][0]
+                route_display = get_base_route_name(s1['route'])
+                direction = get_direction_label(s1['route'])
+                dir_info = f" {direction}" if direction else ""
+                mid = best["transfer_stop"]
+                safety = best.get("safety_note", "")
+                parts.append(f"  👉 需轉乘 {safety}")
+                parts.append(f"  1. 搭【{route_display}】{dir_info} 從 [{s1['from']}] 上車 (等候: {best['wait_text']})")
+                parts.append(f"     坐到 [{mid}] 下車 (行車約 {int(best['static_time'])} 分鐘)")
+                parts.append(f"  2. 抵達 [{mid}] 後，請再問我『{mid} 到 {destination}』以獲取最新動態")
+                parts.append(f"  🚶 最後步行 {walk_m}m (約 {walk_t} 分鐘) 到 {destination}")
+
+            parts.append("")
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        logger.error(f"plan_trip_to_location error: {e}", exc_info=True)
+        return f"規劃路線時發生錯誤：{e}"
+
+
+# ====================================================================
 #  啟動入口
 # ====================================================================
 

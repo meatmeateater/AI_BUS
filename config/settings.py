@@ -65,3 +65,14 @@ DIR_BACK = "__back"
 # 直達方案的站數 ≤ 此值時跳過轉乘搜尋（因為短途直達一定最快）
 # 超過此值則同步搜尋轉乘方案，因為轉乘可能比繞遠路的直達更快
 DIRECT_SKIP_THRESHOLD = 12
+
+# === 步行半徑搜尋 ===
+
+# 步行速度 (公尺/分鐘)，一般成人約 70-90m/min
+WALK_SPEED_M_PER_MIN = 80
+
+# 最大允許步行時間 (分鐘)
+MAX_WALK_MINUTES = 5
+
+# 最大搜尋半徑 (公尺) = WALK_SPEED × MAX_WALK_MINUTES
+MAX_WALK_RADIUS_M = WALK_SPEED_M_PER_MIN * MAX_WALK_MINUTES  # 400m

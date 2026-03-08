@@ -13,6 +13,7 @@ data/logs/
 # Data (Generated)
 data/static/
 
-# IDE settings
+# IDE / Agent settings
 .vscode/
 .idea/
+.agent/
