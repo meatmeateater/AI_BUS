@@ -155,7 +155,6 @@ class TDXClient:
                     if attempt < max_retries:
                         wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
                         logger.warning(f"Rate limited (429). Retry {attempt+1}/{max_retries} in {wait}s...")
-                        import time
                         time.sleep(wait)
                         continue
                 
@@ -171,7 +170,6 @@ class TDXClient:
                 
                 # Retry on server errors (5xx)
                 if e.response is not None and e.response.status_code >= 500 and attempt < max_retries:
-                    import time
                     time.sleep(2)
                     continue
                     

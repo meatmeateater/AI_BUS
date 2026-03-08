@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 from typing import Optional, Dict, Any, List
 from .tdx_client import TDXClient
 
@@ -12,14 +13,17 @@ class BusCrawler:
     Replaces the old HTML scraping logic.
     """
     _client = None
+    _client_lock = threading.Lock()
 
     @classmethod
     def get_client(cls):
         if not cls._client:
-            try:
-                cls._client = TDXClient()
-            except Exception as e:
-                logger.error(f"Failed to initialize TDXClient: {e}")
+            with cls._client_lock:
+                if not cls._client:  # Double-check
+                    try:
+                        cls._client = TDXClient()
+                    except Exception as e:
+                        logger.error(f"Failed to initialize TDXClient: {e}")
         return cls._client
 
     @classmethod

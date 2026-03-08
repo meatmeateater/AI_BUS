@@ -386,7 +386,10 @@ class GraphEngine:
                     "stop_count": best_dist
                 })
         
-        if candidates:
+        # Only skip transfer search if ALL direct routes are short (< 12 stops ≈ 30 min)
+        # Otherwise, also search transfers — a transfer might be faster than a long direct
+        DIRECT_SKIP_THRESHOLD = 12
+        if candidates and all(c["stop_count"] <= DIRECT_SKIP_THRESHOLD for c in candidates):
             candidates.sort(key=lambda x: x["static_time"])
             return candidates[:top_k]
 
@@ -483,7 +486,7 @@ class GraphEngine:
                 best_m1 = None
                 best_r1 = None
                 best_from_bridge = None
-                min_time_to_m1 = 9999
+                min_time_to_m1 = INVALID_DISTANCE * TIME_PER_STOP
                 
                 for m1 in m1_candidates:
                      valid_r1s = [r for r in start_routes if m1 in self._stop_index.get(r, {})]

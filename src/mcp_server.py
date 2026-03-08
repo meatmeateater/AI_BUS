@@ -20,7 +20,8 @@ from src.graph_engine import (
 )
 from config.settings import (
     DIR_GO, DIR_BACK, SAFE_TRANSFER_HEADWAY_MINS,
-    DEFAULT_NO_BUS_WAIT, MAX_PARALLEL_WORKERS, TOP_K_RESULTS
+    DEFAULT_NO_BUS_WAIT, MAX_PARALLEL_WORKERS, TOP_K_RESULTS,
+    INVALID_DISTANCE
 )
 
 # Setup logging
@@ -67,7 +68,6 @@ def _normalize_stop_for_eta(stop_name: str, dir_stops: list) -> list:
     用 GraphEngine 的正規化邏輯匹配 ETA 站名。
     回傳所有匹配的 stop dicts。
     """
-    from src.graph_engine import GraphEngine
     variants = GraphEngine._normalize_stop_name(stop_name)
     
     matched = []
@@ -183,7 +183,7 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
                 CacheManager.set_route_data(cache_key, freqs)
         if freqs:
             f = freqs[0] 
-            min_h = f.get("MinHeadwayMins", 999)
+            min_h = f.get("MinHeadwayMins", INVALID_DISTANCE)
             if min_h <= SAFE_TRANSFER_HEADWAY_MINS:
                 return True, f"班次密集 (約 {min_h}分一班)", min_h / 2
     except Exception as e:
@@ -226,7 +226,7 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
         elif count == 1:
             return True, "僅剩 1 班車 (注意轉乘風險)", 60
             
-        return False, "已無合適班次 (末班已過或極少)", 999
+        return False, "已無合適班次 (末班已過或極少)", INVALID_DISTANCE
         
     except Exception as e:
         logger.warning(f"Schedule check fail: {e}")
@@ -291,7 +291,7 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
             
         data = CacheManager.get_cached_route_data(real_route_name)
         
-        wait_time = 999 
+        wait_time = INVALID_DISTANCE
         wait_text = "無資料"
         
         if data:
@@ -410,4 +410,8 @@ def plan_trip(start: str, end: str) -> str:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    )
     mcp.run()
