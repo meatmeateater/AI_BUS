@@ -7,7 +7,9 @@
 | 功能 | 說明 |
 |---|---|
 | **路線規劃** | `plan_trip(start, end)` — 最多回傳 3 個方案 (直達 + 轉乘混合排名) |
+| **地點導航** | `plan_trip_to_location(start, dest, lat, lon)` — **【NEW】** 支援 GPS 半徑 400m 目的地搜尋 |
 | **到站查詢** | `get_bus_arrival_time(route, stop, dir)` — 即時 ETA + 狀態 |
+| **小智 AI 接入** | 提供 `xiaozhi_bridge.py` 支援 WSS 反向連線至 `xiaozhi.me` MCP 端點 |
 | **站名模糊匹配** | 台↔臺 互轉、捷運前綴、括號子站展開 |
 | **方向感知** | 去程 / 返程分開計算，不會搞混方向 |
 | **StopUID 精確匹配** | 用唯一站牌 ID 避免同名站混淆 |
@@ -95,13 +97,15 @@ TaipeiBusAI/
 ├── src/
 │   ├── __init__.py
 │   ├── mcp_server.py         # MCP Tool Server 主入口
-│   ├── graph_engine.py        # 離線路網圖引擎 (搜尋演算法)
-│   ├── crawler_core.py        # TDX API 資料適配器
-│   ├── cache_manager.py       # 執行緒安全的 TTL 快取
-│   └── tdx_client.py          # TDX API HTTP 客戶端
+│   ├── graph_engine.py       # 離線路網圖引擎 (搜尋演算法)
+│   ├── crawler_core.py       # TDX API 資料適配器
+│   ├── cache_manager.py      # 執行緒安全的 TTL 快取
+│   └── tdx_client.py         # TDX API HTTP 客戶端
 ├── scripts/
-│   ├── init_static_data.py    # 初始化路線列表
-│   └── build_network_graph.py # 建構離線路網圖
+│   ├── init_static_data.py   # 初始化路線列表
+│   ├── build_network_graph.py# 建構離線路網圖
+│   ├── xiaozhi_bridge.py     # 小智 AI WSS 橋接連線腳本
+│   └── run_server.bat        # 啟動腳本
 ├── tests/
 │   ├── test_graph_engine.py   # GraphEngine 28 個測試
 │   └── test_mcp_server.py     # MCP Server 13 個測試
