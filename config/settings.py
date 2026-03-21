@@ -38,6 +38,13 @@ API_DELAY_SECONDS = 3
 # API 失敗時最大重試次數
 API_MAX_RETRIES = 3
 
+# === Google Maps API ===
+# 由外部環境變數載入，若無此 key 則轉乘規劃將失效
+import os
+from dotenv import load_dotenv
+load_dotenv()
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+
 # === 轉乘安全 ===
 
 # 安全轉乘閾值 (分鐘)

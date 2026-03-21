@@ -34,6 +34,7 @@ if _project_root not in sys.path:
 
 from src.crawler_core import BusCrawler
 from src.cache_manager import CacheManager
+from src.gmaps_client import GmapsClient
 from src.graph_engine import (
     GraphEngine, get_base_route_name, get_direction_label
 )
@@ -290,6 +291,67 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
 
 
 # ====================================================================
+#  Google Maps Fallback 轉乘輔助
+# ====================================================================
+
+def handle_gmaps_transit(start: str, end: str) -> Optional[str]:
+    """
+    向 Google Maps 請求 Transit 轉乘方案，並結合 TDX 取得即時 ETA。
+    回傳一段 Markdown 字串供 MCP 直接輸出。
+    """
+    plan = GmapsClient.get_transit_route(start, end)
+    if not plan:
+        return None
+
+    parts = [f"🌐 💡 已自動啟用 Google Maps 轉乘輔助 (從「{start}」到「{end}」)\n"]
+    est = plan['total_duration_minutes']
+    parts.append(f"{'━' * 40}")
+    parts.append(f"📌 方案 1 — 預估 {est} 分鐘")
+
+    for step in plan['steps']:
+        if step['type'] == 'WALKING':
+            # 只取純文字 (過濾掉 HTML tag)
+            import re
+            clean_instruction = re.sub(r'<[^>]+>', ' ', step['instruction'])
+            parts.append(f"  🚶 步行: {clean_instruction.strip()} (約 {step['duration']})")
+        elif step['type'] == 'TRANSIT':
+            rn = step['route_name']
+            ds = step['departure_stop']
+            arr = step['arrival_stop']
+            ns = step['num_stops']
+            dur = step['duration']
+
+            # 嘗試向 TDX 抓取 ETA
+            wait_text = "無即時資料"
+            real_route_name = find_canonical_route_name(rn) or rn
+            data = CacheManager.get_or_fetch(real_route_name, BusCrawler.get_route_data)
+
+            if data:
+                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
+                valid_etas = []
+                # 簡單取前兩字的站名匹配 (因為 Google 站名和 TDX 常有出入)
+                match_prefix = ds[:2]
+                for s in dir_stops:
+                    s_name = s.get("Name", "")
+                    if s_name in ds or ds in s_name or (match_prefix and s_name.startswith(match_prefix)):
+                        e = s.get("ETA")
+                        if e is not None and int(e) >= 0:
+                            valid_etas.append(int(e))
+
+                if valid_etas:
+                    wait_time = min(valid_etas) / 60.0
+                    wait_text = f"{int(wait_time)} 分鐘"
+                else:
+                    wait_text = "目前無車"
+
+            parts.append(f"  👉 搭乘【{rn}】從 [{ds}] 上車 (等候: {wait_text})")
+            parts.append(f"     抵達 [{arr}] ({ns} 站, {dur})")
+
+    parts.append("\n⚠️ 此轉乘方案由 Google Maps 提供，ETA 為即時系統輔助查詢。")
+    return "\n".join(parts)
+
+
+# ====================================================================
 #  核心路由計算
 # ====================================================================
 
@@ -311,7 +373,21 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     candidates = graph_engine.find_candidate_paths(start, end, top_k=5)
 
     if not candidates:
+        gmaps_fallback = handle_gmaps_transit(start, end)
+        if gmaps_fallback:
+            return {"gmaps_result": gmaps_fallback}
         return {"error": "No candidates"}
+
+    direct_cands = [c for c in candidates if c['type'] == 'direct']
+    if direct_cands:
+        # 只保留直達方案
+        candidates = direct_cands
+    else:
+        # 全部都是轉乘，優先使用 Gmaps
+        gmaps_fallback = handle_gmaps_transit(start, end)
+        if gmaps_fallback:
+            return {"gmaps_result": gmaps_fallback}
+        # 如果 Gmaps 失敗，降級回傳自己算出來的轉乘方案
 
     ranked_results = []
     current_time = datetime.now()
@@ -446,6 +522,9 @@ def plan_trip(start: str, end: str) -> str:
     """
     try:
         result = calculate_best_route(start, end)
+
+        if "gmaps_result" in result:
+            return result["gmaps_result"]
 
         if "error" in result:
             return f"找不到從「{start}」到「{end}」的建議路線。({result['error']})"
