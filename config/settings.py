@@ -27,6 +27,10 @@ CACHE_TTL = 60
 # 台北 + 新北共約 1,266 條路線，1,500 可容納全部路線的即時資料
 CACHE_MAXSIZE = 1500
 
+# 靜態資料（班表 / 班距）快取 TTL (秒)
+# 靜態班表每天更新一次，用 3600s TTL 避免對 TDX 發送不必要的 API 請求 (P-5 修復)
+CACHE_STATIC_TTL = 3600
+
 # === TDX API ===
 
 # 預設城市（也會 fallback 到 NewTaipei）

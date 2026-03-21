@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, List, Dict, Any
 import googlemaps
 from datetime import datetime
@@ -6,6 +7,7 @@ from datetime import datetime
 from config.settings import GOOGLE_MAPS_API_KEY
 
 logger = logging.getLogger(__name__)
+_DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 
 # 初始化實例
 gmaps = None
@@ -95,12 +97,15 @@ class GmapsClient:
                         "duration": duration
                     })
                     
-            return {
+            result = {
                 "total_duration_text": total_duration_text,
                 "total_duration_minutes": total_duration_value,
                 "steps": steps_info,
-                "raw_legs": leg # 保留 raw 供除錯
             }
+            # L-3: raw_legs 只在 DEBUG 模式保留，避免佔用不必要記憶體
+            if _DEBUG:
+                result["raw_legs"] = leg
+            return result
             
         except Exception as e:
             logger.error(f"Google Maps API error: {e}", exc_info=True)

@@ -7,13 +7,12 @@
 | 功能 | 說明 |
 |---|---|
 | **路線規劃** | `plan_trip(start, end)` — 最多回傳 3 個方案 (直達 + 轉乘混合排名) |
-| **地點導航** | `plan_trip_to_location(start, dest, lat, lon)` — **【NEW】** 支援 GPS 半徑 400m 目的地搜尋 |
+| **地點導航** | `plan_trip_to_location(start, dest, lat, lon)` — 支援 GPS 半徑 400m 目的地搜尋 |
 | **到站查詢** | `get_bus_arrival_time(route, stop, dir)` — 即時 ETA + 狀態 |
+| **轉乘降級備援** | 無法找出離線轉乘時，自動呼叫 Google Maps Transit 取得轉乘方案 |
 | **小智 AI 接入** | 提供 `xiaozhi_bridge.py` 支援 WSS 反向連線至 `xiaozhi.me` MCP 端點 |
-| **站名模糊匹配** | 台↔臺 互轉、捷運前綴、括號子站展開 |
-| **方向感知** | 去程 / 返程分開計算，不會搞混方向 |
-| **StopUID 精確匹配** | 用唯一站牌 ID 避免同名站混淆 |
-| **轉乘安全檢查** | 查班距 / 時刻表，評估轉乘是否來得及 |
+| **轉乘安全檢查** | 查班距 / 時刻表（支援跨午夜判讀），評估轉乘是否來得及 |
+| **高併發快取** | 內建 Dog-pile 防護的快取機制，避免 API 被瞬間打穿 |
 
 ## 🏗️ 架構
 
@@ -61,7 +60,10 @@ pip install -r requirements.txt
 
 # 3. 設定環境變數
 cp .env.example .env
-# 編輯 .env，填入 TDX_CLIENT_ID 和 TDX_CLIENT_SECRET
+# 編輯 .env，填寫以下金鑰：
+# - TDX_CLIENT_ID / TDX_CLIENT_SECRET (必要)
+# - GOOGLE_MAPS_API_KEY (必要，供轉乘降級備援)
+# - XIAOZHI_TOKEN (若需連接小智 AI 則需填寫)
 
 # 4. 初始化路線資料
 python scripts/init_static_data.py

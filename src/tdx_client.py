@@ -205,6 +205,14 @@ class TDXClient:
                 response.raise_for_status()
                 return response.json()
 
+            except requests.exceptions.Timeout as e:
+                # L-2 修復：連線逾時也應重試，原本會靜默回傳空 list
+                logger.warning(f"Request timeout for {url} (attempt {attempt+1}/{max_retries})")
+                if attempt < max_retries:
+                    time.sleep(2)
+                    continue
+                return []
+
             except requests.RequestException as e:
                 logger.error(f"Request failed for {url}: {e}")
                 if e.response is not None:

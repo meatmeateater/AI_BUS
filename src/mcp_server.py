@@ -20,6 +20,7 @@
 from mcp.server.fastmcp import FastMCP
 import json
 import os
+import re
 import difflib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -229,11 +230,12 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
     # ── 檢查班距 (高頻路線直接通過) ──
     try:
         cache_key = f"__freq__{route_name}"
-        freqs = CacheManager.get_cached_route_data(cache_key)
+        # P-5 修復: 班距是靜態資料，改用長期快取（3600s）
+        freqs = CacheManager.get_cached_static_data(cache_key)
         if freqs is None:
             freqs = client.get_route_frequency(route_name)
             if freqs:
-                CacheManager.set_route_data(cache_key, freqs)
+                CacheManager.set_static_data(cache_key, freqs)
         if freqs:
             f = freqs[0]
             min_h = f.get("MinHeadwayMins", INVALID_DISTANCE)
@@ -245,39 +247,46 @@ def check_transfer_safety(route_name: str, estimated_arrival: datetime) -> tuple
     # ── 檢查時刻表 (固定班次) ──
     try:
         sched_key = f"__sched__{route_name}"
-        scheds = CacheManager.get_cached_route_data(sched_key)
+        # P-5 修復: 班表是靜態資料，改用長期快取（3600s）
+        scheds = CacheManager.get_cached_static_data(sched_key)
         if scheds is None:
             scheds = client.get_schedule(route_name)
             if scheds:
-                CacheManager.set_route_data(sched_key, scheds)
+                CacheManager.set_static_data(sched_key, scheds)
         if not scheds:
             return False, "無班表資料", 30
 
-        # 找預計到達後的所有有效班次
-        valid_trips = []
-        arrival_str = estimated_arrival.strftime("%H:%M")
+        # H-3 修復：用分鐘數比較，解決字串比較跨午夜 bug
+        # 例如 23:50 到達時，字串 "00:10" < "23:50" → 舊邏輯會漏掉次日班次
+        arrival_minutes = estimated_arrival.hour * 60 + estimated_arrival.minute
 
+        def _time_to_minutes(t: str) -> int:
+            """'HH:MM' → 整數分鐘，若班次時間 < 到達時間則視為次日（+1440）。"""
+            try:
+                h, m = map(int, t.split(':'))
+                minutes = h * 60 + m
+                if minutes < arrival_minutes:
+                    minutes += 1440  # 跨日加一天
+                return minutes
+            except ValueError:
+                return 9999
+
+        valid_trips = []
         for ch in scheds:
-            timetables = ch.get("Timetables", [])
-            for t in timetables:
+            for t in ch.get("Timetables", []):
                 stops = t.get("StopTimes", [])
                 if stops:
                     dep_time = stops[0].get("DepartureTime", "00:00")
-                    if dep_time > arrival_str:
-                        valid_trips.append(dep_time)
+                    dep_min = _time_to_minutes(dep_time)
+                    if dep_min > arrival_minutes:
+                        valid_trips.append((dep_min, dep_time))
 
         valid_trips.sort()
         count = len(valid_trips)
 
         if count >= 2:
-            # 計算等候時間
-            next_bus = valid_trips[0]
-            nb_h, nb_m = map(int, next_bus.split(':'))
-            ea_h, ea_m = estimated_arrival.hour, estimated_arrival.minute
-            wait = (nb_h * 60 + nb_m) - (ea_h * 60 + ea_m)
-            if wait < 0:
-                wait = 0
-
+            next_dep_min, next_bus = valid_trips[0]
+            wait = next_dep_min - arrival_minutes
             return True, f"表定尚有 {count} 班車 (下班 {next_bus})", wait
         elif count == 1:
             return True, "僅剩 1 班車 (注意轉乘風險)", 60
@@ -311,7 +320,6 @@ def handle_gmaps_transit(start: str, end: str) -> Optional[str]:
     for step in plan['steps']:
         if step['type'] == 'WALKING':
             # 只取純文字 (過濾掉 HTML tag)
-            import re
             clean_instruction = re.sub(r'<[^>]+>', ' ', step['instruction'])
             parts.append(f"  🚶 步行: {clean_instruction.strip()} (約 {step['duration']})")
         elif step['type'] == 'TRANSIT':
@@ -349,6 +357,145 @@ def handle_gmaps_transit(start: str, end: str) -> Optional[str]:
 
     parts.append("\n⚠️ 此轉乘方案由 Google Maps 提供，ETA 為即時系統輔助查詢。")
     return "\n".join(parts)
+
+
+# ====================================================================
+#  建計函數: _score_candidates
+#  H-2 修復 — 抽取共用 ETA 計算邏輯，避免 calculate_best_route
+#  和 calculate_best_route_to_area 之間的大量重複程式碼。
+# ====================================================================
+
+def _score_candidates(
+    candidates: List[Dict],
+    current_time: datetime,
+    extra_keys: Optional[Dict] = None
+) -> List[Dict]:
+    """
+    對候選路徑列表計算卻時 ETA、等車時間、轉乘安全性，回傳附加話分後的候選列表。
+
+    Args:
+        candidates:   來自 GraphEngine 的候選路徑
+        current_time: datetime.now()
+        extra_keys:   額外要計入 total_time 的欄位 (e.g. {"walk_min": ...})。
+                      若灰 None 表示無額外欄位。
+
+    Returns:
+        附加了 total_time / wait_text / safety_note / display_route 的候選列表
+        (未要求排序，由呼叫方自行處理)
+    """
+    ranked_results = []
+
+    for cand in candidates:
+        seg1 = cand["segments"][0]
+        route_key = seg1["route"]
+        base_route = get_base_route_name(route_key)
+        stop_from = seg1["from"]
+        stop_from_uid = seg1.get("from_uid")
+
+        real_route_name = find_canonical_route_name(base_route)
+        if not real_route_name:
+            if not routes_map:
+                real_route_name = base_route
+            else:
+                continue
+
+        data = CacheManager.get_cached_route_data(real_route_name)
+
+        wait_time = INVALID_DISTANCE
+        wait_text = "無資料"
+
+        if data:
+            valid_etas = []
+
+            # 依方向後綴選擇站牌清單
+            if route_key.endswith(DIR_GO):
+                dir_stops = data.get("GoDirStops", [])
+            elif route_key.endswith(DIR_BACK):
+                dir_stops = data.get("BackDirStops", [])
+            else:
+                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
+
+            # StopUID 精確比對（優先），否則用站名子字串比對
+            for s in dir_stops:
+                matched = False
+                if stop_from_uid and s.get("StopUID"):
+                    matched = s["StopUID"] == stop_from_uid
+                else:
+                    matched = stop_from in s.get("Name", "")
+
+                if matched:
+                    e = s.get("ETA")
+                    if e is not None and int(e) >= 0:
+                        valid_etas.append(int(e))
+
+            if valid_etas:
+                wait_time = min(valid_etas) / 60.0
+                wait_text = f"{int(wait_time)} 分鐘"
+            else:
+                wait_text = "目前無車"
+                wait_time = DEFAULT_NO_BUS_WAIT
+
+        # 計算總時間
+        remaining = cand.get("remaining_time", 0)
+        extra = sum((cand.get(k, 0) for k in (extra_keys or {}).keys()), 0)
+        total_time = cand["static_time"] + wait_time + remaining + extra
+
+        # 轉乘安全性檢查
+        safety_note = ""
+        if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
+            transfer_base = get_base_route_name(cand["transfer_route"])
+            estimated_arrival_at_mid = current_time + timedelta(
+                minutes=cand["static_time"] + wait_time
+            )
+            is_safe, reason, extra_wait = check_transfer_safety(
+                transfer_base, estimated_arrival_at_mid
+            )
+            safety_note = f"({reason})"
+            if not is_safe:
+                total_time += extra_wait
+
+        cand["total_time"] = total_time
+        cand["wait_text"] = wait_text
+        cand["safety_note"] = safety_note
+        cand["display_route"] = base_route
+        ranked_results.append(cand)
+
+    return ranked_results
+
+
+# ====================================================================
+#  并行 Fetch 輔助函數
+# ====================================================================
+
+def _parallel_fetch(candidates: List[Dict]):
+    """
+    從候選路徑中收集未快取的路線，並行向 TDX 抓取 ETA。
+    合並兩個 calculate_* 函數重複的 Fetch 程序碼。
+    """
+    routes_to_fetch: set = set()
+    for cand in candidates:
+        seg1 = cand["segments"][0]
+        base_route = get_base_route_name(seg1["route"])
+        real_name = find_canonical_route_name(base_route)
+        if not real_name and not routes_map:
+            real_name = base_route
+        if real_name:
+            routes_to_fetch.add(real_name)
+
+    uncached = [r for r in routes_to_fetch if not CacheManager.get_cached_route_data(r)]
+    if uncached:
+        def _fetch(route_id):
+            return route_id, BusCrawler.get_route_data(route_id)
+
+        with ThreadPoolExecutor(max_workers=min(len(uncached), MAX_PARALLEL_WORKERS)) as pool:
+            futures = {pool.submit(_fetch, r): r for r in uncached}
+            for future in as_completed(futures):
+                try:
+                    rid, data = future.result()
+                    if data:
+                        CacheManager.set_route_data(rid, data)
+                except Exception as e:
+                    logger.warning(f"Parallel fetch failed: {e}")
 
 
 # ====================================================================
@@ -392,109 +539,11 @@ def calculate_best_route(start: str, end: str) -> Dict[str, Any]:
     ranked_results = []
     current_time = datetime.now()
 
-    # ── 步驟 2: 收集需要抓取的路線，並行 API fetch ──
-    routes_to_fetch = set()
-    for cand in candidates:
-        seg1 = cand["segments"][0]
-        base_route = get_base_route_name(seg1["route"])
-        real_name = find_canonical_route_name(base_route)
-        if not real_name and not routes_map:
-            real_name = base_route
-        if real_name:
-            routes_to_fetch.add(real_name)
+    # ── 步驟 2: 並行 API fetch ──
+    _parallel_fetch(candidates)
 
-    # 只抓未快取的路線
-    uncached = [r for r in routes_to_fetch if not CacheManager.get_cached_route_data(r)]
-    if uncached:
-        def _fetch(route_id):
-            return route_id, BusCrawler.get_route_data(route_id)
-
-        with ThreadPoolExecutor(max_workers=min(len(uncached), MAX_PARALLEL_WORKERS)) as pool:
-            futures = {pool.submit(_fetch, r): r for r in uncached}
-            for future in as_completed(futures):
-                try:
-                    rid, data = future.result()
-                    if data:
-                        CacheManager.set_route_data(rid, data)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch failed: {e}")
-
-    # ── 步驟 3: 對每個候選計算即時分數 ──
-    for cand in candidates:
-        seg1 = cand["segments"][0]
-        route_key = seg1["route"]
-        base_route = get_base_route_name(route_key)
-        stop_from = seg1["from"]
-        stop_from_uid = seg1.get("from_uid")
-
-        real_route_name = find_canonical_route_name(base_route)
-        if not real_route_name:
-            if not routes_map:
-                real_route_name = base_route
-            else:
-                continue
-
-        data = CacheManager.get_cached_route_data(real_route_name)
-
-        wait_time = INVALID_DISTANCE  # 預設：無資料時的懲罰
-        wait_text = "無資料"
-
-        if data:
-            valid_etas = []
-
-            # 根據方向後綴選擇站牌清單
-            if route_key.endswith(DIR_GO):
-                dir_stops = data.get("GoDirStops", [])
-            elif route_key.endswith(DIR_BACK):
-                dir_stops = data.get("BackDirStops", [])
-            else:
-                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
-
-            # 用 StopUID 精確匹配（優先），否則用站名子字串匹配
-            for s in dir_stops:
-                matched = False
-                if stop_from_uid and s.get("StopUID"):
-                    matched = s["StopUID"] == stop_from_uid
-                else:
-                    matched = stop_from in s.get("Name", "")
-
-                if matched:
-                    e = s.get("ETA")
-                    if e is not None and int(e) >= 0:
-                        valid_etas.append(int(e))
-
-            if valid_etas:
-                wait_time_sec = min(valid_etas)
-                wait_time = wait_time_sec / 60.0
-                wait_text = f"{int(wait_time)} 分鐘"
-            else:
-                wait_text = "目前無車"
-                wait_time = DEFAULT_NO_BUS_WAIT
-
-        # ── 計算總時間 ──
-        remaining = cand.get("remaining_time", 0)
-        total_time = cand["static_time"] + wait_time + remaining
-
-        # ── 步驟 4: 轉乘安全性檢查 ──
-        safety_note = ""
-        if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
-            transfer_route_key = cand["transfer_route"]
-            transfer_base = get_base_route_name(transfer_route_key)
-            estimated_arrival_at_mid = current_time + timedelta(
-                minutes=cand["static_time"] + wait_time
-            )
-            is_safe, reason, extra_wait = check_transfer_safety(
-                transfer_base, estimated_arrival_at_mid
-            )
-            safety_note = f"({reason})"
-            if not is_safe:
-                total_time += extra_wait
-
-        cand["total_time"] = total_time
-        cand["wait_text"] = wait_text
-        cand["safety_note"] = safety_note
-        cand["display_route"] = base_route
-        ranked_results.append(cand)
+    # ── 步驟 3-4: 計算即時分數（含轉乘安全性） ──
+    ranked_results = _score_candidates(candidates, current_time)
 
     # ── 步驟 5: 排序，取 top-N ──
     ranked_results.sort(key=lambda x: x["total_time"])
@@ -600,105 +649,11 @@ def calculate_best_route_to_area(
     current_time = datetime.now()
 
     # ── 步驟 3: 並行 fetch 即時 ETA ──
-    routes_to_fetch = set()
-    for cand in candidates:
-        seg1 = cand["segments"][0]
-        base_route = get_base_route_name(seg1["route"])
-        real_name = find_canonical_route_name(base_route)
-        if not real_name and not routes_map:
-            real_name = base_route
-        if real_name:
-            routes_to_fetch.add(real_name)
+    _parallel_fetch(candidates)
 
-    uncached = [r for r in routes_to_fetch if not CacheManager.get_cached_route_data(r)]
-    if uncached:
-        def _fetch(route_id):
-            return route_id, BusCrawler.get_route_data(route_id)
-
-        with ThreadPoolExecutor(max_workers=min(len(uncached), MAX_PARALLEL_WORKERS)) as pool:
-            futures = {pool.submit(_fetch, r): r for r in uncached}
-            for future in as_completed(futures):
-                try:
-                    rid, data = future.result()
-                    if data:
-                        CacheManager.set_route_data(rid, data)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch failed: {e}")
-
-    # ── 步驟 4: 對每個候選計算即時分數 ──
-    for cand in candidates:
-        seg1 = cand["segments"][0]
-        route_key = seg1["route"]
-        base_route = get_base_route_name(route_key)
-        stop_from = seg1["from"]
-        stop_from_uid = seg1.get("from_uid")
-
-        real_route_name = find_canonical_route_name(base_route)
-        if not real_route_name:
-            if not routes_map:
-                real_route_name = base_route
-            else:
-                continue
-
-        data = CacheManager.get_cached_route_data(real_route_name)
-
-        wait_time = INVALID_DISTANCE
-        wait_text = "無資料"
-
-        if data:
-            valid_etas = []
-            if route_key.endswith(DIR_GO):
-                dir_stops = data.get("GoDirStops", [])
-            elif route_key.endswith(DIR_BACK):
-                dir_stops = data.get("BackDirStops", [])
-            else:
-                dir_stops = data.get("GoDirStops", []) + data.get("BackDirStops", [])
-
-            for s in dir_stops:
-                matched = False
-                if stop_from_uid and s.get("StopUID"):
-                    matched = s["StopUID"] == stop_from_uid
-                else:
-                    matched = stop_from in s.get("Name", "")
-
-                if matched:
-                    e = s.get("ETA")
-                    if e is not None and int(e) >= 0:
-                        valid_etas.append(int(e))
-
-            if valid_etas:
-                wait_time_sec = min(valid_etas)
-                wait_time = wait_time_sec / 60.0
-                wait_text = f"{int(wait_time)} 分鐘"
-            else:
-                wait_text = "目前無車"
-                wait_time = DEFAULT_NO_BUS_WAIT
-
-        # total = 等車 + 搭車 + 剩餘 + 步行
-        remaining = cand.get("remaining_time", 0)
-        walk_min = cand.get("walk_min", 0)
-        total_time = cand["static_time"] + wait_time + remaining + walk_min
-
-        # 轉乘安全檢查
-        safety_note = ""
-        if cand["type"] == "transfer_greedy" and cand.get("transfer_route"):
-            transfer_route_key = cand["transfer_route"]
-            transfer_base = get_base_route_name(transfer_route_key)
-            estimated_arrival_at_mid = current_time + timedelta(
-                minutes=cand["static_time"] + wait_time
-            )
-            is_safe, reason, extra_wait = check_transfer_safety(
-                transfer_base, estimated_arrival_at_mid
-            )
-            safety_note = f"({reason})"
-            if not is_safe:
-                total_time += extra_wait
-
-        cand["total_time"] = total_time
-        cand["wait_text"] = wait_text
-        cand["safety_note"] = safety_note
-        cand["display_route"] = base_route
-        ranked_results.append(cand)
+    # ── 步驟 4: 計算即時分數（含步行時間 + 轉乘安全性）──
+    # extra_keys={"walk_min"} 讓 _score_candidates 自動把 cand["walk_min"] 納入 total_time
+    ranked_results = _score_candidates(candidates, current_time, extra_keys={"walk_min": 0})
 
     # ── 步驟 5: 排序，取 top-N ──
     ranked_results.sort(key=lambda x: x["total_time"])
@@ -791,4 +746,8 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
     )
+    # P-1 修復: 啟動時預熱路網圖，避免第一次查詢時發生 ~256ms 延遲
+    logger.info("Pre-loading graph...")
+    graph_engine.load_graph()
+    logger.info("Graph loaded. Starting MCP server.")
     mcp.run()

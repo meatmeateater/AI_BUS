@@ -10,10 +10,12 @@ xiaozhi_bridge.py — 將 TaipeiBusAI MCP Server 接入小智 AI (xiaozhi.me)
 依賴：  pip install websockets
 """
 import asyncio
-import subprocess
 import sys
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,19 +23,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WSS_URL = (
-    "wss://api.xiaozhi.me/mcp/?token="
-    "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJ1c2VySWQiOjY5NTUyMCwiYWdlbnRJZCI6MTM0NzQyMywiZW5kcG9pbnRJZCI6ImFnZW50XzEz"
-    "NDc0MjMiLCJwdXJwb3NlIjoibWNwLWVuZHBvaW50IiwiaWF0IjoxNzczNDAwMzcyLCJleHAiOjE4"
-    "MDQ5NTc5NzJ9."
-    "EJC_CI-PhkQH62XKPM-GAPi4ngcZeKVuhOcYvV4FwOiFtiVc8q_ZkvJTwBccXOpc7kP6IlplZ8u"
-    "JdKi0dTm5gQ"
-)
+# 從環境變數讀取 — 絕對不要把 Token 硬寫在程式碼裡
+_token = os.getenv("XIAOZHI_TOKEN")
+if not _token:
+    logger.error("缺少 XIAOZHI_TOKEN 環境變數，請在 .env 中設定後重試。")
+    sys.exit(1)
+
+WSS_URL = f"wss://api.xiaozhi.me/mcp/?token={_token}"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-async def run_bridge():
+async def _run_bridge_once():
+    """單次橋接嘗試（失敗由外層 run_bridge 重連）。"""
     try:
         import websockets
     except ImportError:
@@ -50,7 +51,6 @@ async def run_bridge():
     )
     logger.info(f"MCP Server PID: {proc.pid}")
 
-    # 背景記錄 stderr
     async def log_stderr():
         try:
             async for line in proc.stderr:
@@ -62,9 +62,8 @@ async def run_bridge():
 
     logger.info("連接 xiaozhi.me WSS...")
     try:
-        # websockets 11+ 用 connect(), 12+ 部分版本改 connect as contextmanager
         async with websockets.connect(
-            WSS_URL, 
+            WSS_URL,
             ping_interval=30,
             subprotocols=["mcp"]
         ) as ws:
@@ -102,6 +101,7 @@ async def run_bridge():
 
     except Exception as e:
         logger.error(f"橋接錯誤: {e}", exc_info=True)
+        raise  # 讓外層重連機制知道已斷線
     finally:
         stderr_task.cancel()
         if proc.returncode is None:
@@ -110,7 +110,20 @@ async def run_bridge():
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 proc.kill()
-        logger.info("已關閉。")
+        logger.info("子程序已關閉。")
+
+
+async def run_bridge():
+    """帶自動重連的主迴圈（M-4 修復）。"""
+    RECONNECT_DELAY = 5  # 秒
+    while True:
+        try:
+            await _run_bridge_once()
+        except SystemExit:
+            raise  # 致命錯誤（如缺少金鑰）不重連
+        except Exception as e:
+            logger.error(f"連線中斷: {e}，{RECONNECT_DELAY} 秒後重連...")
+            await asyncio.sleep(RECONNECT_DELAY)
 
 
 if __name__ == "__main__":

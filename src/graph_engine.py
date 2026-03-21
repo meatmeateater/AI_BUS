@@ -534,7 +534,8 @@ class GraphEngine:
                         best_r1 = r
                         best_from = sg
 
-            if min_d1 >= MAX_VALID_DISTANCE or not best_r1:
+            # P-2 修復: Leg1 超過 20 站則跳過（避免深度搜尋超長迂迴路線）
+            if min_d1 > 20 or min_d1 >= MAX_VALID_DISTANCE or not best_r1:
                 continue
 
             # 找最佳 Leg2 (Mid → End)
